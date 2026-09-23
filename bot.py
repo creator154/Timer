@@ -53,19 +53,6 @@ def delete_timer():
 # ADMIN CHECK
 # =========================
 
-async def is_admin(update: Update):
-    user = update.effective_user
-
-    if not user:
-        return False
-
-    return user.id == ADMIN_ID
-
-
-# =========================
-# TIMER FORMAT
-# =========================
-
 def format_time(seconds):
 
     seconds = max(0, int(seconds))
@@ -80,18 +67,18 @@ def format_time(seconds):
     seconds %= 60
 
     return (
+        "𝗦𝘂𝗺𝗶𝘁 𝗧𝗿𝗶𝗽𝗮𝘁𝗵𝗶 🇮🇳\n\n"
+
+        f"🔵 {days}𝗗   "
+        f"🟣 {hours:02d}𝗛\n"
+
+        f"🟢 {minutes:02d}𝗠   "
+        f"🔴 {seconds:02d}𝗦\n\n"
+
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "     ⏳ <b>𝗟𝗜𝗩𝗘 𝗧𝗜𝗠𝗘𝗥</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        f"   🔵 <b>𝟮𝟮𝟬𝗗</b>   "
-        f"🟣 <b>{hours:02d}𝗛</b>\n"
-
-        f"   🟢 <b>{minutes:02d}𝗠</b>    "
-        f"🔴 <b>{seconds:02d}𝗦</b>\n\n"
-
+        "     ⏳ 𝗟𝗜𝗩𝗘 𝗧𝗜𝗠𝗘𝗥\n"
         "━━━━━━━━━━━━━━━━━━━━"
-    ).replace("𝟮𝟮𝟬𝗗", f"{days}𝗗")
+    )
 
 
 # =========================
