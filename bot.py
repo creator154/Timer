@@ -189,25 +189,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⏹ <code>/stoptimer</code>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "👥 <b>𝗪𝗮𝗻𝘁 𝘁𝗵𝗶𝘀 𝗶𝗻 𝘆𝗼𝘂𝗿 𝗴𝗿𝗼𝘂𝗽?</b>\n"
-        "📩 <b>𝗖𝗼𝗻𝘁𝗮𝗰𝘁:</b> @SumitTripathi\n\n"
+        "📩 <b>𝗖𝗼𝗻𝘁𝗮𝗰𝘁:</b> <b>@SumitTripathi</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
 
-    keyboard = [
+    keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "🔴 𝗔𝗗𝗗 𝗠𝗘 𝗧𝗢 𝗚𝗥𝗢𝗨𝗣",
-                url="https://t.me/SumitTripathi"
+                url="https://t.me/NEET_TIMERS_BOT?startgroup=true"
             )
         ]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    ])
 
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=reply_markup
+        reply_markup=keyboard
     )
 
 
@@ -235,9 +233,7 @@ async def timer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    duration_text = " ".join(context.args)
-
-    duration = parse_duration(duration_text)
+    duration = parse_duration(" ".join(context.args))
 
     if not duration:
 
@@ -266,14 +262,14 @@ async def timer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     delete_timer()
 
-    # New timer
+    # Create new timer
     end_time = time.time() + duration
 
     msg = await update.message.reply_text(
         format_time(duration)
     )
 
-    # Pin message
+    # Pin timer
     try:
 
         await context.bot.pin_chat_message(
@@ -331,7 +327,7 @@ async def stop_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     delete_timer()
 
-    # Unpin old timer
+    # Unpin timer
     if data:
 
         try:
@@ -351,7 +347,7 @@ async def stop_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# RESTORE TIMER AFTER RESTART
+# RESTORE TIMER
 # =========================
 
 async def restore_timer(application):
@@ -374,7 +370,7 @@ async def restore_timer(application):
         delete_timer()
         return
 
-    # Already finished
+    # Timer already finished
     if end_time <= time.time():
 
         try:
@@ -396,7 +392,7 @@ async def restore_timer(application):
         delete_timer()
         return
 
-    # Continue timer
+    # Continue timer after restart
     timer_task = asyncio.create_task(
         timer_loop(
             application,
@@ -412,7 +408,6 @@ async def restore_timer(application):
 # =========================
 
 async def post_init(application):
-
     await restore_timer(application)
 
 
