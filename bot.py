@@ -18,7 +18,7 @@ timer_task = None
 
 
 # =========================
-# TIMER FILE
+# SAVE TIMER
 # =========================
 
 def save_timer(end_time, chat_id, message_id):
@@ -29,6 +29,10 @@ def save_timer(end_time, chat_id, message_id):
             "message_id": message_id
         }, f)
 
+
+# =========================
+# LOAD TIMER
+# =========================
 
 def load_timer():
     if not os.path.exists(TIMER_FILE):
@@ -41,6 +45,10 @@ def load_timer():
         return None
 
 
+# =========================
+# DELETE TIMER FILE
+# =========================
+
 def delete_timer():
     if os.path.exists(TIMER_FILE):
         try:
@@ -51,6 +59,20 @@ def delete_timer():
 
 # =========================
 # ADMIN CHECK
+# =========================
+
+async def is_admin(update: Update):
+
+    user = update.effective_user
+
+    if not user:
+        return False
+
+    return user.id == ADMIN_ID
+
+
+# =========================
+# TIMER DESIGN
 # =========================
 
 def format_time(seconds):
@@ -82,7 +104,7 @@ def format_time(seconds):
 
 
 # =========================
-# PARSE DURATION
+# PARSE TIMER
 # =========================
 
 def parse_duration(text):
@@ -141,28 +163,46 @@ async def timer_loop(
                 end_time - time.time()
             )
 
-            # TIMER FINISHED
+            # =====================
+            # TIME'S UP
+            # =====================
+
             if remaining <= 0:
 
                 try:
+
                     await application.bot.edit_message_text(
+
                         chat_id=chat_id,
+
                         message_id=message_id,
+
                         text=(
+                            "𝗦𝘂𝗺𝗶𝘁 𝗧𝗿𝗶𝗽𝗮𝘁𝗵𝗶 🇮🇳\n\n"
+                            "🚀 <b>𝗧𝗜𝗠𝗘'𝗦 𝗨𝗣!</b>\n\n"
                             "━━━━━━━━━━━━━━━━━━━━\n"
-                            "     🚀 <b>𝗧𝗜𝗠𝗘'𝗦 𝗨𝗣!</b>\n"
+                            "     ⏳ 𝗟𝗜𝗩𝗘 𝗧𝗜𝗠𝗘𝗥\n"
                             "━━━━━━━━━━━━━━━━━━━━"
                         ),
+
                         parse_mode=ParseMode.HTML
                     )
+
                 except Exception as e:
-                    print("Finish error:", e)
+
+                    print(
+                        "Finish error:",
+                        e
+                    )
 
                 delete_timer()
 
                 break
 
-            # CURRENT TIMER
+            # =====================
+            # UPDATE TIMER
+            # =====================
+
             text = format_time(remaining)
 
             if text != last_text:
@@ -170,17 +210,22 @@ async def timer_loop(
                 try:
 
                     await application.bot.edit_message_text(
+
                         chat_id=chat_id,
+
                         message_id=message_id,
-                        text=text,
-                        parse_mode=ParseMode.HTML
+
+                        text=text
                     )
 
                     last_text = text
 
                 except Exception as e:
 
-                    print("Update error:", e)
+                    print(
+                        "Update error:",
+                        e
+                    )
 
             await asyncio.sleep(1)
 
@@ -191,11 +236,12 @@ async def timer_loop(
     finally:
 
         if timer_task is asyncio.current_task():
+
             timer_task = None
 
 
 # =========================
-# START
+# START COMMAND
 # =========================
 
 async def start(
@@ -231,9 +277,13 @@ async def timer_command(
     global timer_task
 
     if not await is_admin(update):
+
         return
 
-    # NO ARGUMENT
+    # =====================
+    # NO DURATION
+    # =====================
+
     if not context.args:
 
         await update.message.reply_text(
@@ -251,18 +301,25 @@ async def timer_command(
 
         return
 
-    duration_text = " ".join(context.args)
+    duration_text = " ".join(
+        context.args
+    )
 
-    duration = parse_duration(duration_text)
+    duration = parse_duration(
+        duration_text
+    )
 
-    # INVALID
+    # =====================
+    # INVALID DURATION
+    # =====================
+
     if not duration:
 
         await update.message.reply_text(
 
             "❌ <b>Invalid duration!</b>\n\n"
 
-            "Example:\n"
+            "Use:\n"
             "<code>/timer 220d 5h 30m</code>",
 
             parse_mode=ParseMode.HTML
@@ -270,34 +327,50 @@ async def timer_command(
 
         return
 
+    # =====================
     # STOP OLD TIMER
+    # =====================
+
     if timer_task:
 
         timer_task.cancel()
 
         try:
+
             await timer_task
+
         except asyncio.CancelledError:
+
             pass
+
         except Exception:
+
             pass
 
         timer_task = None
 
     delete_timer()
 
+    # =====================
     # END TIME
-    end_time = time.time() + duration
+    # =====================
 
-    # CREATE MESSAGE
-    msg = await update.message.reply_text(
-
-        format_time(duration),
-
-        parse_mode=ParseMode.HTML
+    end_time = (
+        time.time() + duration
     )
 
+    # =====================
+    # CREATE MESSAGE
+    # =====================
+
+    msg = await update.message.reply_text(
+        format_time(duration)
+    )
+
+    # =====================
     # PIN MESSAGE
+    # =====================
+
     try:
 
         await context.bot.pin_chat_message(
@@ -311,9 +384,15 @@ async def timer_command(
 
     except Exception as e:
 
-        print("Pin error:", e)
+        print(
+            "Pin error:",
+            e
+        )
 
-    # SAVE
+    # =====================
+    # SAVE TIMER
+    # =====================
+
     save_timer(
 
         end_time,
@@ -323,7 +402,10 @@ async def timer_command(
         msg.message_id
     )
 
-    # START LOOP
+    # =====================
+    # START TIMER
+    # =====================
+
     timer_task = asyncio.create_task(
 
         timer_loop(
@@ -351,28 +433,43 @@ async def stop_timer(
     global timer_task
 
     if not await is_admin(update):
+
         return
 
-    # CANCEL LOOP
+    # =====================
+    # CANCEL TIMER
+    # =====================
+
     if timer_task:
 
         timer_task.cancel()
 
         try:
+
             await timer_task
+
         except asyncio.CancelledError:
+
             pass
+
         except Exception:
+
             pass
 
         timer_task = None
 
-    # GET SAVED TIMER
+    # =====================
+    # LOAD DATA
+    # =====================
+
     data = load_timer()
 
     delete_timer()
 
+    # =====================
     # UNPIN
+    # =====================
+
     if data:
 
         try:
@@ -386,7 +483,14 @@ async def stop_timer(
 
         except Exception as e:
 
-            print("Unpin error:", e)
+            print(
+                "Unpin error:",
+                e
+            )
+
+    # =====================
+    # CONFIRM
+    # =====================
 
     await update.message.reply_text(
 
@@ -397,7 +501,7 @@ async def stop_timer(
 
 
 # =========================
-# RESTORE AFTER RESTART
+# RESTORE TIMER
 # =========================
 
 async def restore_timer(application):
@@ -407,15 +511,22 @@ async def restore_timer(application):
     data = load_timer()
 
     if not data:
+
         return
 
     try:
 
-        end_time = float(data["end_time"])
+        end_time = float(
+            data["end_time"]
+        )
 
-        chat_id = int(data["chat_id"])
+        chat_id = int(
+            data["chat_id"]
+        )
 
-        message_id = int(data["message_id"])
+        message_id = int(
+            data["message_id"]
+        )
 
     except Exception:
 
@@ -423,7 +534,10 @@ async def restore_timer(application):
 
         return
 
+    # =====================
     # ALREADY FINISHED
+    # =====================
+
     if end_time <= time.time():
 
         try:
@@ -435,8 +549,10 @@ async def restore_timer(application):
                 message_id=message_id,
 
                 text=(
+                    "𝗦𝘂𝗺𝗶𝘁 𝗧𝗿𝗶𝗽𝗮𝘁𝗵𝗶 🇮🇳\n\n"
+                    "🚀 <b>𝗧𝗜𝗠𝗘'𝗦 𝗨𝗣!</b>\n\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    "     🚀 <b>𝗧𝗜𝗠𝗘'𝗦 𝗨𝗣!</b>\n"
+                    "     ⏳ 𝗟𝗜𝗩𝗘 𝗧𝗜𝗠𝗘𝗥\n"
                     "━━━━━━━━━━━━━━━━━━━━"
                 ),
 
@@ -444,13 +560,17 @@ async def restore_timer(application):
             )
 
         except Exception:
+
             pass
 
         delete_timer()
 
         return
 
+    # =====================
     # CONTINUE TIMER
+    # =====================
+
     timer_task = asyncio.create_task(
 
         timer_loop(
@@ -472,7 +592,9 @@ async def restore_timer(application):
 
 async def post_init(application):
 
-    await restore_timer(application)
+    await restore_timer(
+        application
+    )
 
 
 # =========================
@@ -499,18 +621,29 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     application.add_handler(
-        CommandHandler("timer", timer_command)
+        CommandHandler(
+            "timer",
+            timer_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("stoptimer", stop_timer)
+        CommandHandler(
+            "stoptimer",
+            stop_timer
+        )
     )
 
-    print("🟢 LIVE TIMER BOT STARTED")
+    print(
+        "🟢 LIVE TIMER BOT STARTED"
+    )
 
     application.run_polling()
 
