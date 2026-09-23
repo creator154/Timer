@@ -89,8 +89,6 @@ def format_time(seconds):
     seconds %= 60
 
     return (
-        "𝗦𝘂𝗺𝗶𝘁 𝗧𝗿𝗶𝗽𝗮𝘁𝗵𝗶 🇮🇳\n\n"
-
         f"🔵 {days}𝗗   "
         f"🟣 {hours:02d}𝗛\n"
 
