@@ -13,11 +13,12 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 TIMER_FILE = "timer.json"
+
 timer_task = None
 
 
 # =========================
-# TIMER STORAGE
+# TIMER FILE
 # =========================
 
 def save_timer(end_time, chat_id, message_id):
@@ -49,16 +50,20 @@ def delete_timer():
 
 
 # =========================
-# ADMIN
+# ADMIN CHECK
 # =========================
 
 async def is_admin(update: Update):
     user = update.effective_user
-    return bool(user and user.id == ADMIN_ID)
+
+    if not user:
+        return False
+
+    return user.id == ADMIN_ID
 
 
 # =========================
-# TIMER DESIGN
+# TIMER FORMAT
 # =========================
 
 def format_time(seconds):
@@ -75,17 +80,22 @@ def format_time(seconds):
     seconds %= 60
 
     return (
-        "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩\n"
-        "       ⏳ <b>𝗟𝗜𝗩𝗘 𝗧𝗜𝗠𝗘𝗥</b>\n\n"
-        "┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐\n"
-        f"│ 🟦 <b>{days}D</b> │ │ 🟪 <b>{hours:02d}H</b> │ "
-        f"│ 🟩 <b>{minutes:02d}M</b> │ │ 🟥 <b>{seconds:02d}S</b> │\n"
-        "└─────┘ └─────┘ └─────┘ └─────┘"
-    )
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "     ⏳ <b>𝗟𝗜𝗩𝗘 𝗧𝗜𝗠𝗘𝗥</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"   🔵 <b>𝟮𝟮𝟬𝗗</b>   "
+        f"🟣 <b>{hours:02d}𝗛</b>\n"
+
+        f"   🟢 <b>{minutes:02d}𝗠</b>    "
+        f"🔴 <b>{seconds:02d}𝗦</b>\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━"
+    ).replace("𝟮𝟮𝟬𝗗", f"{days}𝗗")
 
 
 # =========================
-# DURATION PARSER
+# PARSE DURATION
 # =========================
 
 def parse_duration(text):
@@ -98,7 +108,10 @@ def parse_duration(text):
         r"(?:(\d+)\s*s)?\s*$"
     )
 
-    match = re.fullmatch(pattern, text.lower().strip())
+    match = re.fullmatch(
+        pattern,
+        text.lower().strip()
+    )
 
     if not match:
         return None
@@ -119,10 +132,15 @@ def parse_duration(text):
 
 
 # =========================
-# LIVE TIMER
+# TIMER LOOP
 # =========================
 
-async def timer_loop(application, chat_id, message_id, end_time):
+async def timer_loop(
+    application,
+    chat_id,
+    message_id,
+    end_time
+):
 
     global timer_task
 
@@ -132,8 +150,11 @@ async def timer_loop(application, chat_id, message_id, end_time):
 
         while True:
 
-            remaining = int(end_time - time.time())
+            remaining = int(
+                end_time - time.time()
+            )
 
+            # TIMER FINISHED
             if remaining <= 0:
 
                 try:
@@ -141,8 +162,9 @@ async def timer_loop(application, chat_id, message_id, end_time):
                         chat_id=chat_id,
                         message_id=message_id,
                         text=(
-                            "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩\n"
-                            "       🚀 <b>𝗧𝗜𝗠𝗘'𝗦 𝗨𝗣!</b>"
+                            "━━━━━━━━━━━━━━━━━━━━\n"
+                            "     🚀 <b>𝗧𝗜𝗠𝗘'𝗦 𝗨𝗣!</b>\n"
+                            "━━━━━━━━━━━━━━━━━━━━"
                         ),
                         parse_mode=ParseMode.HTML
                     )
@@ -150,8 +172,10 @@ async def timer_loop(application, chat_id, message_id, end_time):
                     print("Finish error:", e)
 
                 delete_timer()
+
                 break
 
+            # CURRENT TIMER
             text = format_time(remaining)
 
             if text != last_text:
@@ -168,94 +192,133 @@ async def timer_loop(application, chat_id, message_id, end_time):
                     last_text = text
 
                 except Exception as e:
+
                     print("Update error:", e)
 
             await asyncio.sleep(1)
 
     except asyncio.CancelledError:
+
         raise
 
     finally:
+
         if timer_task is asyncio.current_task():
             timer_task = None
 
 
 # =========================
-# /START
+# START
 # =========================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await update.message.reply_text(
+
         "⏳ <b>𝗟𝗜𝗩𝗘 𝗧𝗜𝗠𝗘𝗥 𝗕𝗢𝗧</b>\n\n"
+
         "Admin Commands:\n\n"
-        "<code>/timer 200d 25h 25m</code>\n"
+
+        "<code>/timer 220d</code>\n"
+        "<code>/timer 220d 5h 30m</code>\n"
+        "<code>/timer 220d 5h 30m 20s</code>\n\n"
+
         "<code>/stoptimer</code>",
+
         parse_mode=ParseMode.HTML
     )
 
 
 # =========================
-# /TIMER
+# TIMER COMMAND
 # =========================
 
-async def timer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def timer_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     global timer_task
 
     if not await is_admin(update):
         return
 
+    # NO ARGUMENT
     if not context.args:
 
         await update.message.reply_text(
+
             "❌ <b>Duration missing!</b>\n\n"
+
             "Example:\n"
-            "<code>/timer 200d 25h 25m</code>",
+            "<code>/timer 220d</code>\n\n"
+
+            "Or:\n"
+            "<code>/timer 220d 5h 30m</code>",
+
             parse_mode=ParseMode.HTML
         )
+
         return
 
-    duration = parse_duration(" ".join(context.args))
+    duration_text = " ".join(context.args)
 
+    duration = parse_duration(duration_text)
+
+    # INVALID
     if not duration:
 
         await update.message.reply_text(
+
             "❌ <b>Invalid duration!</b>\n\n"
-            "Use:\n"
-            "<code>/timer 200d 25h 25m</code>",
+
+            "Example:\n"
+            "<code>/timer 220d 5h 30m</code>",
+
             parse_mode=ParseMode.HTML
         )
+
         return
 
-    # Stop previous timer
+    # STOP OLD TIMER
     if timer_task:
 
         timer_task.cancel()
 
         try:
             await timer_task
-        except:
+        except asyncio.CancelledError:
+            pass
+        except Exception:
             pass
 
         timer_task = None
 
     delete_timer()
 
+    # END TIME
     end_time = time.time() + duration
 
-    # Create timer message
+    # CREATE MESSAGE
     msg = await update.message.reply_text(
+
         format_time(duration),
+
         parse_mode=ParseMode.HTML
     )
 
-    # Pin
+    # PIN MESSAGE
     try:
 
         await context.bot.pin_chat_message(
+
             chat_id=update.effective_chat.id,
+
             message_id=msg.message_id,
+
             disable_notification=True
         )
 
@@ -263,65 +326,85 @@ async def timer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         print("Pin error:", e)
 
-    # Save
+    # SAVE
     save_timer(
+
         end_time,
+
         update.effective_chat.id,
+
         msg.message_id
     )
 
-    # Start
+    # START LOOP
     timer_task = asyncio.create_task(
+
         timer_loop(
+
             context.application,
+
             update.effective_chat.id,
+
             msg.message_id,
+
             end_time
         )
     )
 
 
 # =========================
-# /STOPTIMER
+# STOP TIMER
 # =========================
 
-async def stop_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_timer(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     global timer_task
 
     if not await is_admin(update):
         return
 
+    # CANCEL LOOP
     if timer_task:
 
         timer_task.cancel()
 
         try:
             await timer_task
-        except:
+        except asyncio.CancelledError:
+            pass
+        except Exception:
             pass
 
         timer_task = None
 
+    # GET SAVED TIMER
     data = load_timer()
 
     delete_timer()
 
-    # Unpin old timer
+    # UNPIN
     if data:
 
         try:
 
             await context.bot.unpin_chat_message(
+
                 chat_id=data["chat_id"],
+
                 message_id=data["message_id"]
             )
 
         except Exception as e:
+
             print("Unpin error:", e)
 
     await update.message.reply_text(
+
         "⏹ <b>Timer stopped.</b>",
+
         parse_mode=ParseMode.HTML
     )
 
@@ -342,25 +425,34 @@ async def restore_timer(application):
     try:
 
         end_time = float(data["end_time"])
+
         chat_id = int(data["chat_id"])
+
         message_id = int(data["message_id"])
 
     except Exception:
 
         delete_timer()
+
         return
 
+    # ALREADY FINISHED
     if end_time <= time.time():
 
         try:
 
             await application.bot.edit_message_text(
+
                 chat_id=chat_id,
+
                 message_id=message_id,
+
                 text=(
-                    "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩\n"
-                    "       🚀 <b>𝗧𝗜𝗠𝗘'𝗦 𝗨𝗣!</b>"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "     🚀 <b>𝗧𝗜𝗠𝗘'𝗦 𝗨𝗣!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━"
                 ),
+
                 parse_mode=ParseMode.HTML
             )
 
@@ -368,19 +460,31 @@ async def restore_timer(application):
             pass
 
         delete_timer()
+
         return
 
+    # CONTINUE TIMER
     timer_task = asyncio.create_task(
+
         timer_loop(
+
             application,
+
             chat_id,
+
             message_id,
+
             end_time
         )
     )
 
 
+# =========================
+# POST INIT
+# =========================
+
 async def post_init(application):
+
     await restore_timer(application)
 
 
@@ -391,12 +495,19 @@ async def post_init(application):
 def main():
 
     if not TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing")
+
+        raise RuntimeError(
+            "BOT_TOKEN is missing"
+        )
 
     application = (
+
         Application.builder()
+
         .token(TOKEN)
+
         .post_init(post_init)
+
         .build()
     )
 
@@ -418,4 +529,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
