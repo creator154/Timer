@@ -1,9 +1,9 @@
 import os
 import re
-import json
 import time
 import asyncio
 
+import psycopg2
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -25,80 +25,192 @@ from telegram.ext import (
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-TIMER_FILE = "timer.json"
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
+
+if not ADMIN_ID:
+    raise RuntimeError("ADMIN_ID is missing")
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is missing. Add Heroku Postgres first."
+    )
+
 
 # chat_id -> asyncio.Task
 timer_tasks = {}
 
 
 # =========================================================
-# CHECK TOKEN
+# DATABASE
 # =========================================================
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing.")
+def db_connect():
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require"
+    )
 
 
-# =========================================================
-# TIMER STORAGE
-# =========================================================
+def init_db():
 
-def load_all_timers():
-    if not os.path.exists(TIMER_FILE):
-        return {}
+    conn = db_connect()
 
     try:
-        with open(TIMER_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
 
-        if isinstance(data, dict):
-            return data
+        cur = conn.cursor()
 
-    except Exception:
-        pass
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS timers (
+                chat_id BIGINT PRIMARY KEY,
+                message_id BIGINT NOT NULL,
+                end_time DOUBLE PRECISION NOT NULL
+            )
+        """)
 
-    return {}
+        conn.commit()
+
+        cur.close()
+
+    finally:
+
+        conn.close()
+
+    print("✅ Database initialized")
 
 
-def save_all_timers(data):
+def save_timer(
+    chat_id,
+    message_id,
+    end_time
+):
+
+    conn = db_connect()
+
     try:
-        with open(TIMER_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"Timer save error: {e}")
+
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            INSERT INTO timers
+                (chat_id, message_id, end_time)
+            VALUES
+                (%s, %s, %s)
+            ON CONFLICT (chat_id)
+            DO UPDATE SET
+                message_id = EXCLUDED.message_id,
+                end_time = EXCLUDED.end_time
+            """,
+            (
+                chat_id,
+                message_id,
+                end_time,
+            )
+        )
+
+        conn.commit()
+
+        cur.close()
+
+    finally:
+
+        conn.close()
 
 
-def save_chat_timer(chat_id, end_time, message_id):
-    data = load_all_timers()
+def get_timer(chat_id):
 
-    data[str(chat_id)] = {
-        "end_time": end_time,
-        "message_id": message_id,
-    }
+    conn = db_connect()
 
-    save_all_timers(data)
+    try:
+
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT message_id, end_time
+            FROM timers
+            WHERE chat_id = %s
+            """,
+            (chat_id,)
+        )
+
+        row = cur.fetchone()
+
+        cur.close()
+
+        if not row:
+            return None
+
+        return {
+            "message_id": row[0],
+            "end_time": row[1],
+        }
+
+    finally:
+
+        conn.close()
 
 
-def get_chat_timer(chat_id):
-    data = load_all_timers()
-    return data.get(str(chat_id))
+def get_all_timers():
+
+    conn = db_connect()
+
+    try:
+
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT chat_id, message_id, end_time
+            FROM timers
+            """
+        )
+
+        rows = cur.fetchall()
+
+        cur.close()
+
+        return rows
+
+    finally:
+
+        conn.close()
 
 
-def delete_chat_timer(chat_id):
-    data = load_all_timers()
+def delete_timer(chat_id):
 
-    if str(chat_id) in data:
-        del data[str(chat_id)]
+    conn = db_connect()
 
-    save_all_timers(data)
+    try:
+
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            DELETE FROM timers
+            WHERE chat_id = %s
+            """,
+            (chat_id,)
+        )
+
+        conn.commit()
+
+        cur.close()
+
+    finally:
+
+        conn.close()
 
 
 # =========================================================
-# OWNER CHECK
+# OWNER
 # =========================================================
 
 async def is_owner(update: Update):
+
     user = update.effective_user
 
     if not user:
@@ -108,16 +220,21 @@ async def is_owner(update: Update):
 
 
 # =========================================================
-# BOT ADMIN CHECK
+# BOT ADMIN
 # =========================================================
 
-async def bot_is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def bot_is_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     chat = update.effective_chat
 
     if not chat:
         return False
 
     try:
+
         member = await context.bot.get_chat_member(
             chat_id=chat.id,
             user_id=context.bot.id,
@@ -129,32 +246,42 @@ async def bot_is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        print(f"Admin check error: {e}")
+
+        print(
+            f"Admin check error: {e}"
+        )
+
         return False
 
 
 # =========================================================
-# FORMAT TIMER
+# TIMER FORMAT
 # =========================================================
 
-def format_time(total_seconds):
+def format_time(seconds):
 
-    total_seconds = max(0, int(total_seconds))
+    seconds = max(
+        0,
+        int(seconds)
+    )
 
-    days = total_seconds // 86400
-    total_seconds %= 86400
+    days = seconds // 86400
+    seconds %= 86400
 
-    hours = total_seconds // 3600
-    total_seconds %= 3600
+    hours = seconds // 3600
+    seconds %= 3600
 
-    minutes = total_seconds // 60
-    seconds = total_seconds % 60
+    minutes = seconds // 60
+    seconds %= 60
 
     return (
-        f"🔵 <b>{days}𝗗</b>   🟣 <b>{hours:02d}𝗛</b>\n"
-        f"🟢 <b>{minutes:02d}𝗠</b>   🔴 <b>{seconds:02d}𝗦</b>\n\n"
+        f"🔵 <b>{days}𝗗</b>   "
+        f"🟣 <b>{hours:02d}𝗛</b>\n"
+        f"🟢 <b>{minutes:02d}𝗠</b>   "
+        f"🔴 <b>{seconds:02d}𝗦</b>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"     🎯 <b>𝗡𝗘𝗘𝗧 𝟮𝟬𝟮𝟳 𝗧𝗜𝗠𝗘𝗥 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪𝗡</b>\n"
+        f"     🎯 <b>𝗡𝗘𝗘𝗧 𝟮𝟬𝟮𝟳 "
+        f"𝗧𝗜𝗠𝗘𝗥 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪𝗡</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -205,17 +332,14 @@ def parse_duration(text):
         elif unit == "s":
             total += value
 
-    if total <= 0:
-        return None
-
-    return total
+    return total if total > 0 else None
 
 
 # =========================================================
-# CANCEL EXISTING TASK
+# CANCEL TASK
 # =========================================================
 
-async def cancel_chat_task(chat_id):
+async def cancel_task(chat_id):
 
     task = timer_tasks.get(chat_id)
 
@@ -227,12 +351,17 @@ async def cancel_chat_task(chat_id):
 
             try:
                 await task
+
             except asyncio.CancelledError:
                 pass
+
             except Exception:
                 pass
 
-    timer_tasks.pop(chat_id, None)
+    timer_tasks.pop(
+        chat_id,
+        None
+    )
 
 
 # =========================================================
@@ -243,14 +372,16 @@ async def timer_loop(
     application,
     chat_id,
     message_id,
-    end_time,
+    end_time
 ):
 
     try:
 
         while True:
 
-            remaining = int(end_time - time.time())
+            remaining = int(
+                end_time - time.time()
+            )
 
             if remaining <= 0:
                 break
@@ -260,25 +391,29 @@ async def timer_loop(
                 await application.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text=format_time(remaining),
+                    text=format_time(
+                        remaining
+                    ),
                     parse_mode=ParseMode.HTML,
                 )
 
             except Exception as e:
 
-                error_text = str(e).lower()
+                print(
+                    f"Edit error [{chat_id}]: {e}"
+                )
 
-                # Message was deleted / chat unavailable
+                error = str(e).lower()
+
                 if (
-                    "message to edit not found" in error_text
-                    or "message can't be edited" in error_text
-                    or "chat not found" in error_text
+                    "message to edit not found"
+                    in error
+                    or "message can't be edited"
+                    in error
+                    or "chat not found"
+                    in error
                 ):
                     break
-
-                print(
-                    f"Timer edit error [{chat_id}]: {e}"
-                )
 
             await asyncio.sleep(1)
 
@@ -293,13 +428,15 @@ async def timer_loop(
             )
 
         except Exception as e:
+
             print(
-                f"Time-up edit error [{chat_id}]: {e}"
+                f"Time-up error [{chat_id}]: {e}"
             )
 
-        delete_chat_timer(chat_id)
+        delete_timer(chat_id)
 
     except asyncio.CancelledError:
+
         raise
 
     except Exception as e:
@@ -310,46 +447,10 @@ async def timer_loop(
 
     finally:
 
-        timer_tasks.pop(chat_id, None)
-
-
-# =========================================================
-# START
-# =========================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    text = (
-        "🎯 <b>𝗦𝗨𝗠𝗜𝗧'𝗦 𝗡𝗘𝗘𝗧 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "⏳ <b>𝗡𝗘𝗘𝗧 𝟮𝟬𝟮𝟳 𝗟𝗜𝗩𝗘 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪𝗡</b>\n\n"
-        "📌 <code>/timer 220d</code>\n"
-        "📌 <code>/timer 220d 5h 30m</code>\n"
-        "⏹ <code>/stoptimer</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "👥 <b>𝗪𝗮𝗻𝘁 𝘁𝗵𝗶𝘀 𝗶𝗻 𝘆𝗼𝘂𝗿 𝗴𝗿𝗼𝘂𝗽?</b>\n"
-        "📩 <b>𝗖𝗼𝗻𝘁𝗮𝗰𝘁:</b> "
-        "<b>@SumitTripathi</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🔴 𝗔𝗗𝗗 𝗠𝗘 𝗧𝗢 𝗚𝗥𝗢𝗨𝗣",
-                url="https://t.me/NEET_TIMERS_BOT?startgroup=true"
-            )
-        ]
-    ])
-
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
-    )
+        timer_tasks.pop(
+            chat_id,
+            None
+        )
 
 
 # =========================================================
@@ -360,11 +461,14 @@ async def create_timer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
+    args
 ):
 
-    duration_text = " ".join(context.args)
+    duration_text = " ".join(args)
 
-    duration = parse_duration(duration_text)
+    duration = parse_duration(
+        duration_text
+    )
 
     if not duration:
 
@@ -377,7 +481,7 @@ async def create_timer(
 
             await target.reply_text(
                 "❌ <b>Invalid timer.</b>\n\n"
-                "Example:\n"
+                "Examples:\n"
                 "<code>/timer 220d</code>\n"
                 "<code>/timer 220d 5h 30m</code>\n"
                 "<code>/timer 2h 30m</code>",
@@ -386,13 +490,29 @@ async def create_timer(
 
         return
 
-    # Cancel previous timer
-    await cancel_chat_task(chat_id)
+    # Stop old timer
+    await cancel_task(chat_id)
 
-    # Delete old saved timer
-    delete_chat_timer(chat_id)
+    old_timer = get_timer(chat_id)
 
-    end_time = time.time() + duration
+    if old_timer:
+
+        try:
+
+            await context.bot.unpin_chat_message(
+                chat_id=chat_id,
+                message_id=old_timer["message_id"],
+            )
+
+        except Exception:
+            pass
+
+    delete_timer(chat_id)
+
+    # New end time
+    end_time = (
+        time.time() + duration
+    )
 
     # Send timer
     message = await context.bot.send_message(
@@ -401,7 +521,7 @@ async def create_timer(
         parse_mode=ParseMode.HTML,
     )
 
-    # Pin timer
+    # Pin
     try:
 
         await context.bot.pin_chat_message(
@@ -416,14 +536,14 @@ async def create_timer(
             f"Pin error [{chat_id}]: {e}"
         )
 
-    # Save timer
-    save_chat_timer(
-        chat_id,
-        end_time,
-        message.message_id,
+    # SAVE TO DATABASE
+    save_timer(
+        chat_id=chat_id,
+        message_id=message.message_id,
+        end_time=end_time,
     )
 
-    # Start timer task
+    # Start live loop
     task = asyncio.create_task(
         timer_loop(
             context.application,
@@ -435,10 +555,60 @@ async def create_timer(
 
     timer_tasks[chat_id] = task
 
+    print(
+        f"✅ Timer started: {chat_id}"
+    )
+
 
 # =========================================================
-# NORMAL TIMER COMMAND
-# PRIVATE / GROUP / SUPERGROUP
+# /START
+# =========================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    text = (
+        "🎯 <b>𝗦𝗨𝗠𝗜𝗧'𝗦 𝗡𝗘𝗘𝗧 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪𝗡</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⏳ <b>𝗡𝗘𝗘𝗧 𝟮𝟬𝟮𝟳 "
+        "𝗟𝗜𝗩𝗘 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪𝗡</b>\n\n"
+        "📌 <code>/timer 220d</code>\n"
+        "📌 <code>/timer 220d 5h 30m</code>\n"
+        "⏹ <code>/stoptimer</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👥 <b>𝗪𝗮𝗻𝘁 𝘁𝗵𝗶𝘀 𝗶𝗻 𝘆𝗼𝘂𝗿 𝗴𝗿𝗼𝘂𝗽?</b>\n"
+        "📩 <b>𝗖𝗼𝗻𝘁𝗮𝗰𝘁:</b> "
+        "<b>@SumitTripathi</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔴 𝗔𝗗𝗗 𝗠𝗘 𝗧𝗢 𝗚𝗥𝗢𝗨𝗣",
+                url=(
+                    "https://t.me/"
+                    "NEET_TIMERS_BOT"
+                    "?startgroup=true"
+                )
+            )
+        ]
+    ])
+
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+# =========================================================
+# /TIMER
 # =========================================================
 
 async def timer_command(
@@ -463,7 +633,7 @@ async def timer_command(
 
             return
 
-    # GROUP / SUPERGROUP
+    # GROUP
     elif chat.type in (
         ChatType.GROUP,
         ChatType.SUPERGROUP,
@@ -472,7 +642,7 @@ async def timer_command(
         if not await is_owner(update):
 
             await update.message.reply_text(
-                "❌ <b>Only the bot owner can start the timer.</b>",
+                "❌ <b>Only the bot owner can use this command.</b>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -497,14 +667,15 @@ async def timer_command(
         update,
         context,
         chat.id,
+        context.args,
     )
 
 
 # =========================================================
-# CHANNEL TIMER COMMAND
+# CHANNEL COMMAND
 # =========================================================
 
-async def channel_timer_command(
+async def channel_command_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -514,32 +685,63 @@ async def channel_timer_command(
     if not post:
         return
 
+    text = (
+        post.text
+        or post.caption
+        or ""
+    ).strip()
+
+    if not text:
+        return
+
+    print(
+        f"📢 CHANNEL POST: {text}"
+    )
+
+    first = text.split()[0]
+
+    command = first.split("@")[0].lower()
+
+    args = text.split()[1:]
+
     chat = update.effective_chat
 
     if not chat:
         return
 
-    # Bot must be admin in channel
+    # Make sure bot is admin
     if not await bot_is_admin(
         update,
         context
     ):
 
         print(
-            f"Bot is not admin in channel {chat.id}"
+            f"❌ Bot is not admin: {chat.id}"
         )
 
         return
 
-    await create_timer(
-        update,
-        context,
-        chat.id,
-    )
+    # TIMER
+    if command == "/timer":
+
+        await create_timer(
+            update,
+            context,
+            chat.id,
+            args,
+        )
+
+    # STOP
+    elif command == "/stoptimer":
+
+        await stop_timer(
+            update,
+            context,
+        )
 
 
 # =========================================================
-# STOP TIMER
+# /STOP TIMER
 # =========================================================
 
 async def stop_timer(
@@ -566,11 +768,9 @@ async def stop_timer(
 
         if not await is_owner(update):
 
-            target = update.message
+            if update.message:
 
-            if target:
-
-                await target.reply_text(
+                await update.message.reply_text(
                     "❌ <b>Only the bot owner can stop the timer.</b>",
                     parse_mode=ParseMode.HTML,
                 )
@@ -594,7 +794,7 @@ async def stop_timer(
 
                 return
 
-    timer = get_chat_timer(chat.id)
+    timer = get_timer(chat.id)
 
     if not timer:
 
@@ -612,29 +812,22 @@ async def stop_timer(
 
         return
 
-    message_id = timer.get("message_id")
+    # Stop live task
+    await cancel_task(chat.id)
 
-    # Cancel task
-    await cancel_chat_task(chat.id)
+    # Remove DB record
+    delete_timer(chat.id)
 
-    # Delete storage
-    delete_chat_timer(chat.id)
+    # Unpin
+    try:
 
-    # Try unpin
-    if message_id:
+        await context.bot.unpin_chat_message(
+            chat_id=chat.id,
+            message_id=timer["message_id"],
+        )
 
-        try:
-
-            await context.bot.unpin_chat_message(
-                chat_id=chat.id,
-                message_id=message_id,
-            )
-
-        except Exception as e:
-
-            print(
-                f"Unpin error [{chat.id}]: {e}"
-            )
+    except Exception:
+        pass
 
     target = (
         update.message
@@ -653,83 +846,27 @@ async def stop_timer(
         except Exception as e:
 
             print(
-                f"Stop message error [{chat.id}]: {e}"
+                f"Stop reply error: {e}"
             )
 
 
 # =========================================================
-# CHANNEL COMMAND ROUTER
-# =========================================================
-
-async def channel_command_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    post = update.channel_post
-
-    if not post:
-        return
-
-    text = post.text or post.caption or ""
-
-    if not text:
-        return
-
-    # First word = command
-    command = (
-        text.split()[0]
-        .split("@")[0]
-        .lower()
-    )
-
-    if command == "/timer":
-
-        await channel_timer_command(
-            update,
-            context
-        )
-
-    elif command == "/stoptimer":
-
-        await stop_timer(
-            update,
-            context
-        )
-
-
-# =========================================================
-# RESTORE TIMERS AFTER RESTART
+# RESTORE ALL TIMERS
 # =========================================================
 
 async def restore_timers(
     application: Application
 ):
 
-    data = load_all_timers()
-
-    if not data:
-        return
+    rows = get_all_timers()
 
     print(
-        f"Restoring {len(data)} timer(s)..."
+        f"🔄 Found {len(rows)} saved timer(s)"
     )
 
-    for chat_id_str, timer in list(
-        data.items()
-    ):
+    for chat_id, message_id, end_time in rows:
 
         try:
-
-            chat_id = int(chat_id_str)
-
-            end_time = float(
-                timer["end_time"]
-            )
-
-            message_id = int(
-                timer["message_id"]
-            )
 
             remaining = int(
                 end_time - time.time()
@@ -737,13 +874,23 @@ async def restore_timers(
 
             if remaining <= 0:
 
-                delete_chat_timer(
-                    chat_id
-                )
+                delete_timer(chat_id)
+
+                try:
+
+                    await application.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=time_up_text(),
+                        parse_mode=ParseMode.HTML,
+                    )
+
+                except Exception:
+                    pass
 
                 continue
 
-            # Check message still exists
+            # Verify message can still be edited
             try:
 
                 await application.bot.edit_message_text(
@@ -756,13 +903,11 @@ async def restore_timers(
             except Exception as e:
 
                 print(
-                    f"Could not restore "
-                    f"timer {chat_id}: {e}"
+                    f"❌ Cannot restore "
+                    f"{chat_id}: {e}"
                 )
 
-                delete_chat_timer(
-                    chat_id
-                )
+                delete_timer(chat_id)
 
                 continue
 
@@ -778,23 +923,25 @@ async def restore_timers(
             timer_tasks[chat_id] = task
 
             print(
-                f"Timer restored: {chat_id}"
+                f"✅ Restored timer: {chat_id}"
             )
 
         except Exception as e:
 
             print(
-                f"Restore error: {e}"
+                f"Restore error [{chat_id}]: {e}"
             )
 
 
 # =========================================================
-# POST INIT
+# STARTUP
 # =========================================================
 
 async def post_init(
     application: Application
 ):
+
+    init_db()
 
     await restore_timers(
         application
@@ -814,10 +961,7 @@ def main():
         .build()
     )
 
-    # -----------------------------------------
-    # PRIVATE / GROUP / SUPERGROUP
-    # -----------------------------------------
-
+    # START
     application.add_handler(
         CommandHandler(
             "start",
@@ -825,6 +969,7 @@ def main():
         )
     )
 
+    # PRIVATE / GROUP / SUPERGROUP
     application.add_handler(
         CommandHandler(
             "timer",
@@ -839,30 +984,22 @@ def main():
         )
     )
 
-    # -----------------------------------------
     # CHANNEL
-    # -----------------------------------------
-
     application.add_handler(
         MessageHandler(
-            filters.UpdateType.CHANNEL_POSTS
-            & filters.COMMAND,
+            filters.UpdateType.CHANNEL_POST,
             channel_command_handler
         )
     )
 
     print(
-        "🎯 NEET Timer Bot Started..."
+        "🎯 NEET TIMER BOT STARTED"
     )
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
 
-
-# =========================================================
-# RUN
-# =========================================================
 
 if __name__ == "__main__":
     main()
