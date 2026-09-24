@@ -9,14 +9,13 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import (
-    ParseMode,
-    ChatType,
-)
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 
@@ -29,8 +28,16 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 TIMER_FILE = "timer.json"
 
-# One task per chat/channel
+# chat_id -> asyncio.Task
 timer_tasks = {}
+
+
+# =========================================================
+# CHECK TOKEN
+# =========================================================
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is missing.")
 
 
 # =========================================================
@@ -42,23 +49,24 @@ def load_all_timers():
         return {}
 
     try:
-        with open(TIMER_FILE, "r") as f:
+        with open(TIMER_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        return data if isinstance(data, dict) else {}
+        if isinstance(data, dict):
+            return data
 
-    except Exception as e:
-        print("Load timer error:", e)
-        return {}
+    except Exception:
+        pass
+
+    return {}
 
 
 def save_all_timers(data):
     try:
-        with open(TIMER_FILE, "w") as f:
-            json.dump(data, f)
-
+        with open(TIMER_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
     except Exception as e:
-        print("Save timer error:", e)
+        print(f"Timer save error: {e}")
 
 
 def save_chat_timer(chat_id, end_time, message_id):
@@ -80,34 +88,30 @@ def get_chat_timer(chat_id):
 def delete_chat_timer(chat_id):
     data = load_all_timers()
 
-    data.pop(str(chat_id), None)
+    if str(chat_id) in data:
+        del data[str(chat_id)]
 
     save_all_timers(data)
 
 
 # =========================================================
-# ADMIN CHECK
+# OWNER CHECK
 # =========================================================
 
 async def is_owner(update: Update):
-    """
-    Normal group/private command:
-    checks ADMIN_ID.
-    """
-
     user = update.effective_user
 
-    return bool(
-        user and
-        user.id == ADMIN_ID
-    )
+    if not user:
+        return False
 
+    return user.id == ADMIN_ID
+
+
+# =========================================================
+# BOT ADMIN CHECK
+# =========================================================
 
 async def bot_is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Checks whether the bot itself is admin in the current chat/channel.
-    """
-
     chat = update.effective_chat
 
     if not chat:
@@ -125,12 +129,7 @@ async def bot_is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-
-        print(
-            f"Bot admin check error [{chat.id}]:",
-            e
-        )
-
+        print(f"Admin check error: {e}")
         return False
 
 
@@ -138,33 +137,27 @@ async def bot_is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # FORMAT TIMER
 # =========================================================
 
-def format_time(seconds):
+def format_time(total_seconds):
 
-    seconds = max(0, int(seconds))
+    total_seconds = max(0, int(total_seconds))
 
-    days = seconds // 86400
-    seconds %= 86400
+    days = total_seconds // 86400
+    total_seconds %= 86400
 
-    hours = seconds // 3600
-    seconds %= 3600
+    hours = total_seconds // 3600
+    total_seconds %= 3600
 
-    minutes = seconds // 60
-    seconds %= 60
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
 
     return (
-        f"🔵 <b>{days}𝗗</b>   "
-        f"🟣 <b>{hours:02d}𝗛</b>\n"
-        f"🟢 <b>{minutes:02d}𝗠</b>   "
-        f"🔴 <b>{seconds:02d}𝗦</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "     🎯 <b>𝗡𝗘𝗘𝗧 𝟮𝟬𝟮𝟳 𝗧𝗜𝗠𝗘𝗥 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪𝗡</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━"
+        f"🔵 <b>{days}𝗗</b>   🟣 <b>{hours:02d}𝗛</b>\n"
+        f"🟢 <b>{minutes:02d}𝗠</b>   🔴 <b>{seconds:02d}𝗦</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"     🎯 <b>𝗡𝗘𝗘𝗧 𝟮𝟬𝟮𝟳 𝗧𝗜𝗠𝗘𝗥 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪𝗡</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
     )
 
-
-# =========================================================
-# TIME'S UP
-# =========================================================
 
 def time_up_text():
 
@@ -181,66 +174,65 @@ def time_up_text():
 
 def parse_duration(text):
 
-    pattern = (
-        r"^\s*"
-        r"(?:(\d+)\s*d)?\s*"
-        r"(?:(\d+)\s*h)?\s*"
-        r"(?:(\d+)\s*m)?\s*"
-        r"(?:(\d+)\s*s)?\s*$"
-    )
-
-    match = re.fullmatch(
-        pattern,
-        text.lower().strip()
-    )
-
-    if not match:
+    if not text:
         return None
 
-    days = int(match.group(1) or 0)
-    hours = int(match.group(2) or 0)
-    minutes = int(match.group(3) or 0)
-    seconds = int(match.group(4) or 0)
+    pattern = r"(\d+)\s*(d|h|m|s)"
 
-    total = (
-        days * 86400
-        + hours * 3600
-        + minutes * 60
-        + seconds
+    matches = re.findall(
+        pattern,
+        text.lower()
     )
 
-    return total if total > 0 else None
+    if not matches:
+        return None
+
+    total = 0
+
+    for value, unit in matches:
+
+        value = int(value)
+
+        if unit == "d":
+            total += value * 86400
+
+        elif unit == "h":
+            total += value * 3600
+
+        elif unit == "m":
+            total += value * 60
+
+        elif unit == "s":
+            total += value
+
+    if total <= 0:
+        return None
+
+    return total
 
 
 # =========================================================
-# CANCEL ONE CHAT'S TIMER
+# CANCEL EXISTING TASK
 # =========================================================
 
 async def cancel_chat_task(chat_id):
 
     task = timer_tasks.get(chat_id)
 
-    if not task:
-        return
+    if task:
 
-    task.cancel()
+        if not task.done():
 
-    try:
-        await task
+            task.cancel()
 
-    except asyncio.CancelledError:
-        pass
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
 
-    except Exception as e:
-        print(
-            f"Task cancel error [{chat_id}]:",
-            e
-        )
-
-    timer_tasks.pop(
-        chat_id,
-        None
-    )
+    timer_tasks.pop(chat_id, None)
 
 
 # =========================================================
@@ -256,82 +248,69 @@ async def timer_loop(
 
     try:
 
-        last_text = ""
-
         while True:
 
-            remaining = int(
-                end_time - time.time()
-            )
-
-            # =========================
-            # TIME'S UP
-            # =========================
+            remaining = int(end_time - time.time())
 
             if remaining <= 0:
-
-                try:
-
-                    await application.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text=time_up_text(),
-                        parse_mode=ParseMode.HTML,
-                    )
-
-                except Exception as e:
-
-                    print(
-                        f"Time-up edit error [{chat_id}]:",
-                        e
-                    )
-
-                delete_chat_timer(chat_id)
-
                 break
 
-            # =========================
-            # UPDATE
-            # =========================
+            try:
 
-            text = format_time(remaining)
+                await application.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=format_time(remaining),
+                    parse_mode=ParseMode.HTML,
+                )
 
-            if text != last_text:
+            except Exception as e:
 
-                try:
+                error_text = str(e).lower()
 
-                    await application.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text=text,
-                        parse_mode=ParseMode.HTML,
-                    )
+                # Message was deleted / chat unavailable
+                if (
+                    "message to edit not found" in error_text
+                    or "message can't be edited" in error_text
+                    or "chat not found" in error_text
+                ):
+                    break
 
-                    last_text = text
-
-                except Exception as e:
-
-                    print(
-                        f"Timer update error [{chat_id}]:",
-                        e
-                    )
+                print(
+                    f"Timer edit error [{chat_id}]: {e}"
+                )
 
             await asyncio.sleep(1)
 
-    except asyncio.CancelledError:
+        # TIME UP
+        try:
 
+            await application.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=time_up_text(),
+                parse_mode=ParseMode.HTML,
+            )
+
+        except Exception as e:
+            print(
+                f"Time-up edit error [{chat_id}]: {e}"
+            )
+
+        delete_chat_timer(chat_id)
+
+    except asyncio.CancelledError:
         raise
+
+    except Exception as e:
+
+        print(
+            f"Timer loop error [{chat_id}]: {e}"
+        )
 
     finally:
 
-        current_task = asyncio.current_task()
-
-        if timer_tasks.get(chat_id) is current_task:
-
-            timer_tasks.pop(
-                chat_id,
-                None
-            )
+        timer_tasks.pop(chat_id, None)
 
 
 # =========================================================
@@ -340,42 +319,31 @@ async def timer_loop(
 
 async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     text = (
-        "🎯 <b>𝗦𝗨𝗠𝗜𝗧'𝗦 𝗡𝗘𝗘𝗧 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪𝗡</b>\n\n"
-
+        "🎯 <b>𝗦𝗨𝗠𝗜𝗧'𝗦 𝗡𝗘𝗘𝗧 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-
         "⏳ <b>𝗡𝗘𝗘𝗧 𝟮𝟬𝟮𝟳 𝗟𝗜𝗩𝗘 𝗖𝗢𝗨𝗡𝗧𝗗𝗢𝗪𝗡</b>\n\n"
-
         "📌 <code>/timer 220d</code>\n"
         "📌 <code>/timer 220d 5h 30m</code>\n"
         "⏹ <code>/stoptimer</code>\n\n"
-
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-
         "👥 <b>𝗪𝗮𝗻𝘁 𝘁𝗵𝗶𝘀 𝗶𝗻 𝘆𝗼𝘂𝗿 𝗴𝗿𝗼𝘂𝗽?</b>\n"
-        "📩 <b>𝗖𝗼𝗻𝘁𝗮𝗰𝘁:</b> <b>@SumitTripathi</b>\n\n"
-
+        "📩 <b>𝗖𝗼𝗻𝘁𝗮𝗰𝘁:</b> "
+        "<b>@SumitTripathi</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
 
-    keyboard = InlineKeyboardMarkup(
+    keyboard = InlineKeyboardMarkup([
         [
-            [
-                InlineKeyboardButton(
-                    "🔴 𝗔𝗗𝗗 𝗠𝗘 𝗧𝗢 𝗚𝗥𝗢𝗨𝗣",
-                    url=(
-                        "https://t.me/"
-                        "NEET_TIMERS_BOT"
-                        "?startgroup=true"
-                    ),
-                )
-            ]
+            InlineKeyboardButton(
+                "🔴 𝗔𝗗𝗗 𝗠𝗘 𝗧𝗢 𝗚𝗥𝗢𝗨𝗣",
+                url="https://t.me/NEET_TIMERS_BOT?startgroup=true"
+            )
         ]
-    )
+    ])
 
     await update.message.reply_text(
         text,
@@ -385,12 +353,97 @@ async def start(
 
 
 # =========================================================
-# TIMER COMMAND
+# CREATE TIMER
+# =========================================================
+
+async def create_timer(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+):
+
+    duration_text = " ".join(context.args)
+
+    duration = parse_duration(duration_text)
+
+    if not duration:
+
+        target = (
+            update.message
+            or update.channel_post
+        )
+
+        if target:
+
+            await target.reply_text(
+                "❌ <b>Invalid timer.</b>\n\n"
+                "Example:\n"
+                "<code>/timer 220d</code>\n"
+                "<code>/timer 220d 5h 30m</code>\n"
+                "<code>/timer 2h 30m</code>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        return
+
+    # Cancel previous timer
+    await cancel_chat_task(chat_id)
+
+    # Delete old saved timer
+    delete_chat_timer(chat_id)
+
+    end_time = time.time() + duration
+
+    # Send timer
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=format_time(duration),
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Pin timer
+    try:
+
+        await context.bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=message.message_id,
+            disable_notification=True,
+        )
+
+    except Exception as e:
+
+        print(
+            f"Pin error [{chat_id}]: {e}"
+        )
+
+    # Save timer
+    save_chat_timer(
+        chat_id,
+        end_time,
+        message.message_id,
+    )
+
+    # Start timer task
+    task = asyncio.create_task(
+        timer_loop(
+            context.application,
+            chat_id,
+            message.message_id,
+            end_time,
+        )
+    )
+
+    timer_tasks[chat_id] = task
+
+
+# =========================================================
+# NORMAL TIMER COMMAND
+# PRIVATE / GROUP / SUPERGROUP
 # =========================================================
 
 async def timer_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     chat = update.effective_chat
@@ -398,339 +451,91 @@ async def timer_command(
     if not chat:
         return
 
-    chat_id = chat.id
-
-    # =====================================================
-    # PRIVATE CHAT
-    # =====================================================
-
+    # PRIVATE
     if chat.type == ChatType.PRIVATE:
 
         if not await is_owner(update):
+
+            await update.message.reply_text(
+                "❌ <b>Only the bot owner can use this command.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+
             return
 
-    # =====================================================
     # GROUP / SUPERGROUP
-    # =====================================================
-
     elif chat.type in (
         ChatType.GROUP,
         ChatType.SUPERGROUP,
     ):
 
         if not await is_owner(update):
-            return
 
-        if not await bot_is_admin(
-            update,
-            context
-        ):
-
-            await update.effective_message.reply_text(
-                "❌ <b>Bot must be an admin in this group.</b>",
+            await update.message.reply_text(
+                "❌ <b>Only the bot owner can start the timer.</b>",
                 parse_mode=ParseMode.HTML,
             )
 
             return
 
-    # =====================================================
-    # CHANNEL
-    # =====================================================
-
-    elif chat.type == ChatType.CHANNEL:
-
-        # Channel posts are handled separately,
-        # but this keeps the function safe.
         if not await bot_is_admin(
             update,
             context
         ):
+
+            await update.message.reply_text(
+                "❌ <b>Please make me an admin first.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+
             return
 
     else:
-
         return
 
-    # =====================================================
-    # ARGUMENT CHECK
-    # =====================================================
-
-    if not context.args:
-
-        await update.effective_message.reply_text(
-            "❌ <b>Duration missing!</b>\n\n"
-            "Example:\n"
-            "<code>/timer 220d</code>\n\n"
-            "Or:\n"
-            "<code>/timer 220d 5h 30m</code>",
-            parse_mode=ParseMode.HTML,
-        )
-
-        return
-
-    duration = parse_duration(
-        " ".join(context.args)
+    await create_timer(
+        update,
+        context,
+        chat.id,
     )
-
-    if not duration:
-
-        await update.effective_message.reply_text(
-            "❌ <b>Invalid duration!</b>\n\n"
-            "Use:\n"
-            "<code>/timer 220d 5h 30m</code>",
-            parse_mode=ParseMode.HTML,
-        )
-
-        return
-
-    # =====================================================
-    # STOP OLD TIMER OF THIS CHAT ONLY
-    # =====================================================
-
-    await cancel_chat_task(chat_id)
-
-    old_timer = get_chat_timer(chat_id)
-
-    if old_timer:
-
-        try:
-
-            await context.bot.unpin_chat_message(
-                chat_id=chat_id,
-                message_id=old_timer["message_id"],
-            )
-
-        except Exception as e:
-
-            print(
-                f"Old unpin error [{chat_id}]:",
-                e
-            )
-
-    delete_chat_timer(chat_id)
-
-    # =====================================================
-    # CREATE TIMER
-    # =====================================================
-
-    end_time = time.time() + duration
-
-    try:
-
-        message = await context.bot.send_message(
-            chat_id=chat_id,
-            text=format_time(duration),
-            parse_mode=ParseMode.HTML,
-        )
-
-    except Exception as e:
-
-        print(
-            f"Send timer error [{chat_id}]:",
-            e
-        )
-
-        return
-
-    # =====================================================
-    # PIN TIMER
-    # =====================================================
-
-    try:
-
-        await context.bot.pin_chat_message(
-            chat_id=chat_id,
-            message_id=message.message_id,
-            disable_notification=True,
-        )
-
-    except Exception as e:
-
-        print(
-            f"Pin error [{chat_id}]:",
-            e
-        )
-
-    # =====================================================
-    # SAVE
-    # =====================================================
-
-    save_chat_timer(
-        chat_id,
-        end_time,
-        message.message_id,
-    )
-
-    # =====================================================
-    # START INDEPENDENT TASK
-    # =====================================================
-
-    task = asyncio.create_task(
-        timer_loop(
-            context.application,
-            chat_id,
-            message.message_id,
-            end_time,
-        )
-    )
-
-    timer_tasks[chat_id] = task
 
 
 # =========================================================
-# CHANNEL TIMER
+# CHANNEL TIMER COMMAND
 # =========================================================
 
 async def channel_timer_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    # channel_post exists here
     post = update.channel_post
 
     if not post:
         return
 
-    chat = post.chat
+    chat = update.effective_chat
 
-    chat_id = chat.id
+    if not chat:
+        return
 
-    # Bot must be admin
+    # Bot must be admin in channel
     if not await bot_is_admin(
         update,
         context
     ):
-        return
-
-    # =====================================================
-    # ARGUMENT CHECK
-    # =====================================================
-
-    if not context.args:
-
-        try:
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "❌ <b>Duration missing!</b>\n\n"
-                    "Example:\n"
-                    "<code>/timer 220d</code>\n\n"
-                    "Or:\n"
-                    "<code>/timer 220d 5h 30m</code>"
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-
-        except Exception as e:
-
-            print(
-                f"Channel help error [{chat_id}]:",
-                e
-            )
-
-        return
-
-    duration = parse_duration(
-        " ".join(context.args)
-    )
-
-    if not duration:
-        return
-
-    # =====================================================
-    # STOP OLD CHANNEL TIMER
-    # =====================================================
-
-    await cancel_chat_task(chat_id)
-
-    old_timer = get_chat_timer(chat_id)
-
-    if old_timer:
-
-        try:
-
-            await context.bot.unpin_chat_message(
-                chat_id=chat_id,
-                message_id=old_timer["message_id"],
-            )
-
-        except Exception as e:
-
-            print(
-                f"Channel old unpin error [{chat_id}]:",
-                e
-            )
-
-    delete_chat_timer(chat_id)
-
-    # =====================================================
-    # CREATE CHANNEL TIMER
-    # =====================================================
-
-    end_time = time.time() + duration
-
-    try:
-
-        message = await context.bot.send_message(
-            chat_id=chat_id,
-            text=format_time(duration),
-            parse_mode=ParseMode.HTML,
-        )
-
-    except Exception as e:
 
         print(
-            f"Channel timer send error [{chat_id}]:",
-            e
+            f"Bot is not admin in channel {chat.id}"
         )
 
         return
 
-    # =====================================================
-    # PIN
-    # =====================================================
-
-    try:
-
-        await context.bot.pin_chat_message(
-            chat_id=chat_id,
-            message_id=message.message_id,
-            disable_notification=True,
-        )
-
-    except Exception as e:
-
-        print(
-            f"Channel pin error [{chat_id}]:",
-            e
-        )
-
-    # =====================================================
-    # SAVE
-    # =====================================================
-
-    save_chat_timer(
-        chat_id,
-        end_time,
-        message.message_id,
+    await create_timer(
+        update,
+        context,
+        chat.id,
     )
-
-    # =====================================================
-    # START TASK
-    # =====================================================
-
-    task = asyncio.create_task(
-        timer_loop(
-            context.application,
-            chat_id,
-            message.message_id,
-            end_time,
-        )
-    )
-
-    timer_tasks[chat_id] = task
 
 
 # =========================================================
@@ -739,7 +544,7 @@ async def channel_timer_command(
 
 async def stop_timer(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     chat = update.effective_chat
@@ -747,18 +552,8 @@ async def stop_timer(
     if not chat:
         return
 
-    chat_id = chat.id
-
-    # Owner check for groups/private
-    if chat.type != ChatType.CHANNEL:
-
-        if not await is_owner(update):
-            return
-
-    # Channel:
-    # command comes as channel_post
-    # so bot admin status is enough
-    else:
+    # CHANNEL
+    if update.channel_post:
 
         if not await bot_is_admin(
             update,
@@ -766,144 +561,244 @@ async def stop_timer(
         ):
             return
 
-    # =====================================================
-    # CANCEL ONLY THIS CHAT
-    # =====================================================
+    # PRIVATE / GROUP
+    else:
 
-    await cancel_chat_task(chat_id)
+        if not await is_owner(update):
 
-    timer_data = get_chat_timer(chat_id)
+            target = update.message
 
-    if timer_data:
+            if target:
+
+                await target.reply_text(
+                    "❌ <b>Only the bot owner can stop the timer.</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+
+            return
+
+        if chat.type in (
+            ChatType.GROUP,
+            ChatType.SUPERGROUP,
+        ):
+
+            if not await bot_is_admin(
+                update,
+                context
+            ):
+
+                await update.message.reply_text(
+                    "❌ <b>Please make me an admin first.</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+
+                return
+
+    timer = get_chat_timer(chat.id)
+
+    if not timer:
+
+        target = (
+            update.message
+            or update.channel_post
+        )
+
+        if target:
+
+            await target.reply_text(
+                "ℹ️ <b>No active timer found.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        return
+
+    message_id = timer.get("message_id")
+
+    # Cancel task
+    await cancel_chat_task(chat.id)
+
+    # Delete storage
+    delete_chat_timer(chat.id)
+
+    # Try unpin
+    if message_id:
 
         try:
 
             await context.bot.unpin_chat_message(
-                chat_id=chat_id,
-                message_id=timer_data["message_id"],
+                chat_id=chat.id,
+                message_id=message_id,
             )
 
         except Exception as e:
 
             print(
-                f"Unpin error [{chat_id}]:",
-                e
+                f"Unpin error [{chat.id}]: {e}"
             )
 
-    delete_chat_timer(chat_id)
+    target = (
+        update.message
+        or update.channel_post
+    )
 
-    # =====================================================
-    # RESPONSE
-    # =====================================================
+    if target:
 
-    try:
+        try:
 
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⏹ <b>Timer stopped.</b>",
-            parse_mode=ParseMode.HTML,
+            await target.reply_text(
+                "⏹ <b>Timer stopped.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        except Exception as e:
+
+            print(
+                f"Stop message error [{chat.id}]: {e}"
+            )
+
+
+# =========================================================
+# CHANNEL COMMAND ROUTER
+# =========================================================
+
+async def channel_command_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    post = update.channel_post
+
+    if not post:
+        return
+
+    text = post.text or post.caption or ""
+
+    if not text:
+        return
+
+    # First word = command
+    command = (
+        text.split()[0]
+        .split("@")[0]
+        .lower()
+    )
+
+    if command == "/timer":
+
+        await channel_timer_command(
+            update,
+            context
         )
 
-    except Exception as e:
+    elif command == "/stoptimer":
 
-        print(
-            f"Stop response error [{chat_id}]:",
-            e
+        await stop_timer(
+            update,
+            context
         )
 
 
 # =========================================================
-# RESTORE ALL TIMERS
+# RESTORE TIMERS AFTER RESTART
 # =========================================================
 
-async def restore_timers(application):
+async def restore_timers(
+    application: Application
+):
 
     data = load_all_timers()
 
     if not data:
         return
 
-    now = time.time()
+    print(
+        f"Restoring {len(data)} timer(s)..."
+    )
 
-    for chat_id_string, timer_data in list(data.items()):
+    for chat_id_str, timer in list(
+        data.items()
+    ):
 
         try:
 
-            chat_id = int(chat_id_string)
+            chat_id = int(chat_id_str)
 
             end_time = float(
-                timer_data["end_time"]
+                timer["end_time"]
             )
 
             message_id = int(
-                timer_data["message_id"]
+                timer["message_id"]
             )
 
-        except Exception:
-
-            data.pop(
-                chat_id_string,
-                None
+            remaining = int(
+                end_time - time.time()
             )
 
-            continue
+            if remaining <= 0:
 
-        # =================================================
-        # FINISHED
-        # =================================================
+                delete_chat_timer(
+                    chat_id
+                )
 
-        if end_time <= now:
+                continue
 
+            # Check message still exists
             try:
 
                 await application.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text=time_up_text(),
+                    text=format_time(remaining),
                     parse_mode=ParseMode.HTML,
                 )
 
-            except Exception:
-                pass
+            except Exception as e:
 
-            data.pop(
-                chat_id_string,
-                None
+                print(
+                    f"Could not restore "
+                    f"timer {chat_id}: {e}"
+                )
+
+                delete_chat_timer(
+                    chat_id
+                )
+
+                continue
+
+            task = asyncio.create_task(
+                timer_loop(
+                    application,
+                    chat_id,
+                    message_id,
+                    end_time,
+                )
             )
 
-            continue
+            timer_tasks[chat_id] = task
 
-        # =================================================
-        # RESTORE
-        # =================================================
-
-        task = asyncio.create_task(
-            timer_loop(
-                application,
-                chat_id,
-                message_id,
-                end_time,
+            print(
+                f"Timer restored: {chat_id}"
             )
-        )
 
-        timer_tasks[chat_id] = task
+        except Exception as e:
 
-    save_all_timers(data)
+            print(
+                f"Restore error: {e}"
+            )
 
 
 # =========================================================
 # POST INIT
 # =========================================================
 
-async def post_init(application):
-
-    print("🔄 Restoring timers...")
+async def post_init(
+    application: Application
+):
 
     await restore_timers(
         application
     )
-
-    print("✅ Timers restored.")
 
 
 # =========================================================
@@ -912,12 +807,6 @@ async def post_init(application):
 
 def main():
 
-    if not TOKEN:
-
-        raise RuntimeError(
-            "BOT_TOKEN is missing"
-        )
-
     application = (
         Application.builder()
         .token(TOKEN)
@@ -925,53 +814,45 @@ def main():
         .build()
     )
 
-    # =====================================================
-    # PRIVATE / GROUP COMMANDS
-    # =====================================================
+    # -----------------------------------------
+    # PRIVATE / GROUP / SUPERGROUP
+    # -----------------------------------------
 
     application.add_handler(
         CommandHandler(
             "start",
-            start,
+            start
         )
     )
 
     application.add_handler(
         CommandHandler(
             "timer",
-            timer_command,
+            timer_command
         )
     )
 
     application.add_handler(
         CommandHandler(
             "stoptimer",
-            stop_timer,
+            stop_timer
         )
     )
 
-    # =====================================================
-    # CHANNEL COMMANDS
-    # =====================================================
+    # -----------------------------------------
+    # CHANNEL
+    # -----------------------------------------
 
     application.add_handler(
-        CommandHandler(
-            "timer",
-            channel_timer_command,
-            channel_post=True,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "stoptimer",
-            stop_timer,
-            channel_post=True,
+        MessageHandler(
+            filters.UpdateType.CHANNEL_POSTS
+            & filters.COMMAND,
+            channel_command_handler
         )
     )
 
     print(
-        "🟢 NEET TIMER BOT STARTED"
+        "🎯 NEET Timer Bot Started..."
     )
 
     application.run_polling(
