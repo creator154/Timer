@@ -4,16 +4,16 @@ import re
 import asyncio
 import logging
 import tempfile
-from collections import defaultdict
+from pathlib import Path
 
 import fitz
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import PollType
-from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -22,290 +22,359 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
-MAX_PDF_MB = int(os.getenv("MAX_PDF_MB", "20"))
-POLL_DELAY = float(os.getenv("POLL_DELAY", "1.2"))
+
+MAX_PDF_MB = int(os.getenv("MAX_PDF_MB", "30"))
+POLL_DELAY = float(os.getenv("POLL_DELAY", "0.5"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
-log = logging.getLogger("pdf-quiz-poll-maker")
+# ================= TEXT EXTRACTION =================
 
-
-# ================= TEXT CLEANING =================
 
 def clean_text(text):
-    text = text.replace("\u00a0", " ")
-    text = text.replace("\uf0b7", " ")
-    text = text.replace("\u200b", "")
     text = text.replace("\x00", " ")
+    text = text.replace("\u00a0", " ")
+    text = text.replace("\ufeff", " ")
 
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"\bCC\d{3,}\b", "", text)
-    text = re.sub(r"\bAndroid App\s*\|.*", "", text, flags=re.I)
-    text = re.sub(r"\biOS App\b|\bPW Website\b", "", text, flags=re.I)
+    lines = []
 
-    return text.strip()
+    for line in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", line).strip()
 
+        if not line:
+            continue
 
-# ================= PDF EXTRACTION =================
+        # PDF page footer/header cleanup
+        if re.fullmatch(r"\$//\(1®?", line):
+            continue
+
+        if line in ("ALLEN", "ALLEN®"):
+            continue
+
+        lines.append(line)
+
+    return "\n".join(lines)
+
 
 def extract_page_columns(page):
     """
-    Original two-column extraction method.
-    Left column first, then right column.
+    Extract left column first, then right column.
+    This preserves the reading order of the Allen PDF.
     """
 
     words = page.get_text("words", sort=False)
-    lines = defaultdict(list)
+
+    if not words:
+        return page.get_text("text", sort=True)
+
+    grouped = {}
 
     for word in words:
-        x0, y0, x1, y1, text, block_no, line_no, word_no = word[:8]
+        x0, y0, x1, y1, value, block_no, line_no, word_no = word
+        key = (block_no, line_no)
 
-        lines[(block_no, line_no)].append({
-            "x": x0,
-            "y": y0,
-            "text": text,
-        })
+        grouped.setdefault(key, []).append(word)
 
-    left = []
-    right = []
+    left_lines = []
+    right_lines = []
 
     middle = page.rect.width / 2
 
-    for line_words in lines.values():
-        line_words.sort(key=lambda x: x["x"])
+    for items in grouped.values():
+        items.sort(key=lambda x: x[7])
 
-        line_text = " ".join(
-            item["text"] for item in line_words
-        )
+        line_text = " ".join(item[4] for item in items)
+        x0 = min(item[0] for item in items)
+        y0 = min(item[1] for item in items)
 
-        line_text = clean_text(line_text)
+        line = (y0, x0, line_text)
 
-        if not line_text:
-            continue
-
-        x = min(item["x"] for item in line_words)
-        y = min(item["y"] for item in line_words)
-
-        item = (y, x, line_text)
-
-        if x < middle:
-            left.append(item)
+        if x0 < middle:
+            left_lines.append(line)
         else:
-            right.append(item)
+            right_lines.append(line)
 
-    left.sort(key=lambda x: (x[0], x[1]))
-    right.sort(key=lambda x: (x[0], x[1]))
+    left_lines.sort(key=lambda x: (x[0], x[1]))
+    right_lines.sort(key=lambda x: (x[0], x[1]))
 
-    output = []
+    result = []
 
-    for _, _, text in left:
-        output.append(text)
+    for _, _, line in left_lines:
+        result.append(line)
 
-    output.append("")
+    for _, _, line in right_lines:
+        result.append(line)
 
-    for _, _, text in right:
-        output.append(text)
-
-    return "\n".join(output)
+    return "\n".join(result)
 
 
-def extract_pdf_pages(path):
-    doc = fitz.open(path)
+def extract_pdf_pages(pdf_path):
+    pages = []
 
-    try:
-        return [
-            extract_page_columns(page)
-            for page in doc
-        ]
-    finally:
-        doc.close()
+    with fitz.open(pdf_path) as pdf:
+        for page in pdf:
+            pages.append(clean_text(extract_page_columns(page)))
+
+    return pages
 
 
-# ================= ANSWER KEY PARSER =================
+# ================= OLD PDF FORMAT =================
+# Supports:
+# Q1. Question
+# (A) Option
+# (B) Option
+# (C) Option
+# (D) Option
+#
+# Answer key:
+# Q1 B
+# Q2 D
 
-def parse_answer_key(text):
+
+def parse_old_answer_key(text):
     answers = {}
 
-    # New format:
-    # Que. 1 2 3 4 5
-    # Ans. 3 2 1 4 2
-
-    row_pattern = re.compile(
-        r"\bQue\.?\s*(.*?)\s*\bAns\.?\s*(.*?)"
-        r"(?=\bQue\.?\s*|$)",
-        re.I | re.S,
-    )
-
-    for match in row_pattern.finditer(text):
-        question_part = match.group(1)
-        answer_part = match.group(2)
-
-        question_numbers = re.findall(
-            r"\d{1,3}",
-            question_part,
-        )
-
-        answer_values = re.findall(
-            r"(?<![A-Za-z0-9])([1-4]|[A-D])(?![A-Za-z0-9])",
-            answer_part,
-            re.I,
-        )
-
-        for number, answer in zip(
-            question_numbers,
-            answer_values,
-        ):
-            number = int(number)
-
-            if 1 <= number <= 300:
-                answers[number] = answer.upper()
-
-    # Old format:
-    # Q1 B
-    # Q2 D
-    # Q3 A
-
-    old_pattern = re.compile(
+    pattern = re.compile(
         r"\bQ\s*(\d{1,3})\s*[\.\):\-]?\s*([A-D])\b",
-        re.I,
+        re.IGNORECASE,
     )
 
-    for match in old_pattern.finditer(text):
-        number = int(match.group(1))
+    for match in pattern.finditer(text):
+        qno = int(match.group(1))
         answer = match.group(2).upper()
 
-        if 1 <= number <= 300:
-            answers[number] = answer
-
-    # Alternative old answer format:
-    # 1. B
-    # 2. C
-
-    if not answers:
-        alternative_pattern = re.compile(
-            r"(?m)^\s*(\d{1,3})\s*[.)\-:]\s*"
-            r"\(?([A-D])\)?\s*$",
-            re.I,
-        )
-
-        for match in alternative_pattern.finditer(text):
-            answers[int(match.group(1))] = match.group(2).upper()
+        answers[qno] = ord(answer) - ord("A")
 
     return answers
 
 
-def answer_to_index(answer):
-    if not answer:
-        return None
-
-    answer = str(answer).strip().upper()
-
-    if answer in "ABCD" and len(answer) == 1:
-        return ord(answer) - ord("A")
-
-    if answer in ("1", "2", "3", "4"):
-        return int(answer) - 1
-
-    return None
-
-
-# ================= QUESTION PARSER =================
-
-def parse_questions(text):
+def parse_old_questions(text):
     questions = []
 
-    # Old format: Q1 Question...
-    # New format: 1. Question...
-
     question_pattern = re.compile(
-        r"(?im)^\s*(?:"
-        r"Q\s*(\d{1,3})\s*"
-        r"|"
-        r"(\d{1,3})\s*[.)]\s+"
-        r")"
+        r"(?im)^\s*Q\s*(\d{1,3})\s*[\.\):\-]\s*"
     )
 
-    question_matches = list(
-        question_pattern.finditer(text)
-    )
+    matches = list(question_pattern.finditer(text))
 
-    # Supports:
-    # (A), (B), (C), (D)
-    # (1), (2), (3), (4)
-    # A), B), C), D)
-
-    option_pattern = re.compile(
-        r"\(([A-D1-4])\)\s*"
-        r"|(?<![A-Za-z0-9])([A-D])\)\s*",
-        re.I,
-    )
-
-    for index, match in enumerate(question_matches):
-        number = int(match.group(1) or match.group(2))
-
+    for index, match in enumerate(matches):
         start = match.end()
 
-        if index + 1 < len(question_matches):
-            end = question_matches[index + 1].start()
-        else:
-            end = len(text)
-
-        content = text[start:end].strip()
-
-        content = re.sub(
-            r"Android App\s*\|.*",
-            "",
-            content,
-            flags=re.I,
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(text)
         )
 
-        content = re.sub(
-            r"iOS App|PW Website",
-            "",
-            content,
-            flags=re.I,
+        block = text[start:end].strip()
+
+        option_pattern = re.compile(
+            r"(?im)^\s*\(([A-D])\)\s*"
         )
 
-        # Remove answer-key content from question block.
-        content = re.split(
-            r"\bANSWER\s*KEY\b",
-            content,
-            maxsplit=1,
-            flags=re.I,
-        )[0]
+        option_matches = list(option_pattern.finditer(block))
 
-        option_matches = list(
-            option_pattern.finditer(content)
+        if len(option_matches) < 4:
+            continue
+
+        options = []
+
+        for i in range(4):
+            option_start = option_matches[i].end()
+
+            option_end = (
+                option_matches[i + 1].start()
+                if i + 1 < len(option_matches)
+                else len(block)
+            )
+
+            option_text = block[option_start:option_end].strip()
+            option_text = re.sub(r"\s+", " ", option_text)
+
+            options.append(option_text)
+
+        question_text = block[:option_matches[0].start()].strip()
+        question_text = re.sub(r"\s+", " ", question_text)
+
+        if not question_text:
+            continue
+
+        questions.append({
+            "number": int(match.group(1)),
+            "question": question_text,
+            "options": options,
+        })
+
+    return questions
+
+
+def build_old_quiz(pages):
+    full_text = "\n".join(pages)
+
+    answer_key_match = re.search(
+        r"(?i)ANSWER\s*KEY",
+        full_text,
+    )
+
+    if not answer_key_match:
+        logger.warning("Old-format Answer Key not found")
+        return []
+
+    question_text = full_text[:answer_key_match.start()]
+    answer_text = full_text[answer_key_match.start():]
+
+    questions = parse_old_questions(question_text)
+    answers = parse_old_answer_key(answer_text)
+
+    quiz = []
+
+    for question in questions:
+        qno = question["number"]
+
+        if qno not in answers:
+            continue
+
+        question["correct"] = answers[qno]
+        quiz.append(question)
+
+    logger.info(
+        "Old PDF: questions=%s, answers=%s, matched=%s",
+        len(questions),
+        len(answers),
+        len(quiz),
+    )
+
+    return quiz
+
+
+# ================= NEW PDF FORMAT =================
+# Supports:
+# 1. Question
+# (1) Option
+# (2) Option
+# (3) Option
+# (4) Option
+#
+# Answer key:
+# Que. 1 2 3 4
+# Ans. 3 2 1 4
+
+
+def normalize_exercise_number(value):
+    value = value.upper()
+
+    mapping = {
+        "I": 1,
+        "II": 2,
+        "III": 3,
+        "1": 1,
+        "2": 2,
+        "3": 3,
+    }
+
+    return mapping.get(value)
+
+
+def find_exercise_headings(text):
+    pattern = re.compile(
+        r"(?im)^\s*EXERCISE\s*[-–]?\s*(III|II|I|[123])\b[^\n]*"
+    )
+
+    headings = []
+
+    for match in pattern.finditer(text):
+        number = normalize_exercise_number(match.group(1))
+
+        if number:
+            headings.append({
+                "number": number,
+                "start": match.start(),
+                "end": match.end(),
+                "line": match.group(0),
+                "is_key": bool(
+                    re.search(r"ANSWER\s*KEY", match.group(0), re.I)
+                ),
+            })
+
+    return headings
+
+
+def parse_new_answer_key(text):
+    """
+    Reads Que. and Ans. rows, including rows split across lines.
+    """
+
+    answers = {}
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    question_numbers = []
+
+    for line in lines:
+        que_match = re.match(r"(?i)^Que\.?\s*(.*)$", line)
+
+        if que_match:
+            question_numbers = [
+                int(x) for x in re.findall(r"\d+", que_match.group(1))
+            ]
+            continue
+
+        ans_match = re.match(r"(?i)^Ans\.?\s*(.*)$", line)
+
+        if ans_match and question_numbers:
+            answer_values = [
+                int(x) for x in re.findall(r"\b[1-4]\b", ans_match.group(1))
+            ]
+
+            for qno, answer in zip(question_numbers, answer_values):
+                answers[qno] = answer - 1
+
+            question_numbers = []
+
+    return answers
+
+
+def parse_new_questions(text):
+    questions = []
+
+    question_pattern = re.compile(
+        r"(?m)^\s*(\d{1,3})\.\s+"
+    )
+
+    matches = list(question_pattern.finditer(text))
+
+    for index, match in enumerate(matches):
+        start = match.end()
+
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(text)
         )
 
-        # Find the first complete A-D or 1-4 sequence.
+        block = text[start:end].strip()
+
+        # Locate the four numbered options.
+        option_pattern = re.compile(
+            r"\(([1-4])\)\s*"
+        )
+
+        option_matches = list(option_pattern.finditer(block))
+
+        # Keep the first occurrence of each option label.
         selected = []
         seen = set()
 
         for option_match in option_matches:
-            raw = (
-                option_match.group(1)
-                or option_match.group(2)
-            ).upper()
+            label = int(option_match.group(1))
 
-            if raw in "1234":
-                label = "ABCD"[int(raw) - 1]
-            else:
-                label = raw
-
-            if label in seen:
-                continue
-
-            if label not in "ABCD":
-                continue
-
-            # Keep option order as it appears in the PDF.
-            selected.append((label, option_match))
-            seen.add(label)
+            if label not in seen:
+                selected.append(option_match)
+                seen.add(label)
 
             if len(selected) == 4:
                 break
@@ -313,283 +382,414 @@ def parse_questions(text):
         if len(selected) != 4:
             continue
 
-        if set(label for label, _ in selected) != set("ABCD"):
+        selected.sort(key=lambda x: x.start())
+
+        # Ensure options are in 1, 2, 3, 4 order.
+        labels = [int(x.group(1)) for x in selected]
+
+        if labels != [1, 2, 3, 4]:
             continue
 
-        question_text = clean_text(
-            content[:selected[0][1].start()]
-        )
+        question_text = block[:selected[0].start()].strip()
+        question_text = re.sub(r"\s+", " ", question_text)
 
-        options = {}
+        options = []
 
-        for i, (label, option_match) in enumerate(selected):
-            option_start = option_match.end()
+        for i in range(4):
+            option_start = selected[i].end()
 
-            if i + 1 < len(selected):
-                option_end = selected[i + 1][1].start()
-            else:
-                option_end = len(content)
-
-            option_text = clean_text(
-                content[option_start:option_end]
+            option_end = (
+                selected[i + 1].start()
+                if i < 3
+                else len(block)
             )
 
-            options[label] = option_text
+            option_text = block[option_start:option_end].strip()
+            option_text = re.sub(r"\s+", " ", option_text)
 
-        if not question_text:
-            continue
+            # Remove question IDs such as CC0001 from option endings.
+            option_text = re.sub(
+                r"\bCC\d{3,}\b",
+                "",
+                option_text,
+            ).strip()
 
-        final_options = [
-            options.get("A", ""),
-            options.get("B", ""),
-            options.get("C", ""),
-            options.get("D", ""),
-        ]
+            options.append(option_text)
 
-        # Telegram limits
-        if len(question_text) > 300:
-            log.warning("Question %s exceeds 300 characters", number)
-            continue
-
-        if any(
-            not option or len(option) > 100
-            for option in final_options
-        ):
-            log.warning("Invalid options in question %s", number)
+        if not question_text or any(not x for x in options):
             continue
 
         questions.append({
-            "number": number,
+            "number": int(match.group(1)),
             "question": question_text,
-            "options": final_options,
+            "options": options,
         })
 
     return questions
 
 
-# ================= EXERCISE DETECTION =================
+def build_new_exercises(pages):
+    full_text = "\n".join(pages)
+    headings = find_exercise_headings(full_text)
 
-EXERCISE_PATTERN = re.compile(
-    r"(?im)^\s*EXERCISE\s*[-–—]?\s*"
-    r"([IVXLCDM]+|\d+)\b[^\n]*"
-)
-
-
-def get_answer_key_position(text):
-    return re.search(
-        r"\bANSWER\s*KEY\b",
-        text,
-        re.I,
-    )
-
-
-def build_single_quiz(text):
-    """
-    Original PDF support.
-    Questions before Answer Key, answers after Answer Key.
-    """
-
-    key_match = get_answer_key_position(text)
-
-    if not key_match:
+    if not headings:
+        logger.warning("No exercise headings found")
         return []
 
-    question_text = text[:key_match.start()]
-    answer_text = text[key_match.start():]
+    # Group headings by exercise number.
+    grouped = {}
 
-    questions = parse_questions(question_text)
-    answers = parse_answer_key(answer_text)
-
-    matched = []
-
-    for question in questions:
-        answer = answers.get(question["number"])
-        correct = answer_to_index(answer)
-
-        if correct is None:
-            continue
-
-        question["correct"] = correct
-        matched.append(question)
-
-    matched.sort(key=lambda q: q["number"])
-
-    return matched
-
-
-def build_exercises(pages):
-    """
-    Supports both:
-    1. Old PDFs without exercise headings.
-    2. New PDFs with separate EXERCISE-I, II, III sections.
-    """
-
-    full_text = "\n".join(pages)
-
-    exercise_matches = list(
-        EXERCISE_PATTERN.finditer(full_text)
-    )
+    for heading in headings:
+        grouped.setdefault(heading["number"], []).append(heading)
 
     exercises = []
 
-    # Old PDF format: no exercise headings.
-    if not exercise_matches:
-        questions = build_single_quiz(full_text)
+    for number in sorted(grouped):
+        entries = grouped[number]
 
-        if questions:
-            exercises.append({
-                "name": "All Questions",
-                "questions": questions,
-            })
+        title_heading = None
+        key_heading = None
 
-        return exercises
+        for entry in entries:
+            if entry["is_key"]:
+                key_heading = entry
+            elif title_heading is None:
+                title_heading = entry
 
-    # New PDF format: split by exercise headings.
-    for index, match in enumerate(exercise_matches):
-        exercise_number = match.group(1).upper()
-
-        heading = match.group(0).strip()
-
-        start = match.end()
-
-        if index + 1 < len(exercise_matches):
-            end = exercise_matches[index + 1].start()
-        else:
-            end = len(full_text)
-
-        section = full_text[start:end]
-
-        key_match = get_answer_key_position(section)
-
-        if not key_match:
-            log.warning(
-                "Answer Key not found for Exercise %s",
-                exercise_number,
+        if not title_heading or not key_heading:
+            logger.warning(
+                "Exercise %s title/key heading missing",
+                number,
             )
             continue
 
-        question_text = section[:key_match.start()]
-        answer_text = section[key_match.start():]
+        # Questions are between exercise title and its answer-key heading.
+        question_section = full_text[
+            title_heading["end"]:key_heading["start"]
+        ]
 
-        questions = parse_questions(question_text)
-        answers = parse_answer_key(answer_text)
+        # Answer key continues until the next exercise title.
+        next_title = None
+
+        for other_number, other_entries in grouped.items():
+            if other_number <= number:
+                continue
+
+            for entry in other_entries:
+                if not entry["is_key"]:
+                    if next_title is None or entry["start"] < next_title["start"]:
+                        next_title = entry
+
+        key_end = next_title["start"] if next_title else len(full_text)
+
+        answer_section = full_text[
+            key_heading["end"]:key_end
+        ]
+
+        questions = parse_new_questions(question_section)
+        answers = parse_new_answer_key(answer_section)
 
         matched = []
 
         for question in questions:
-            answer = answers.get(question["number"])
-            correct = answer_to_index(answer)
+            qno = question["number"]
 
-            if correct is None:
+            if qno not in answers:
                 continue
 
-            question["correct"] = correct
+            question["correct"] = answers[qno]
             matched.append(question)
 
-        matched.sort(key=lambda q: q["number"])
+        title = {
+            1: "Exercise-I (Conceptual Questions)",
+            2: "Exercise-II (Previous Year Questions)",
+            3: "Exercise-III (Analytical Questions)",
+        }.get(number, f"Exercise {number}")
 
-        if matched:
-            exercises.append({
-                "name": heading,
-                "questions": matched,
-            })
-
-        log.info(
-            "Exercise %s: questions=%s, answers=%s, matched=%s",
-            exercise_number,
+        logger.info(
+            "%s: questions=%s, answers=%s, matched=%s",
+            title,
             len(questions),
             len(answers),
             len(matched),
         )
 
+        exercises.append({
+            "number": number,
+            "title": title,
+            "questions": matched,
+        })
+
     return exercises
 
 
-# ================= ACCESS CONTROL =================
+# ================= TELEGRAM POLL HELPERS =================
 
-def is_allowed(user_id):
-    return OWNER_ID == 0 or user_id == OWNER_ID
+
+def fit_telegram_limits(quiz):
+    """
+    Telegram limits:
+    Question: 300 characters
+    Option: 100 characters
+
+    Long questions/options are shortened instead of being discarded.
+    """
+
+    result = []
+
+    for item in quiz:
+        question = re.sub(
+            r"\s+",
+            " ",
+            item["question"],
+        ).strip()
+
+        options = [
+            re.sub(r"\s+", " ", option).strip()
+            for option in item["options"]
+        ]
+
+        if len(question) > 300:
+            question = question[:297].rstrip() + "..."
+
+        options = [
+            option if len(option) <= 100
+            else option[:97].rstrip() + "..."
+            for option in options
+        ]
+
+        if (
+            len(options) != 4
+            or not all(options)
+            or item["correct"] not in range(4)
+        ):
+            continue
+
+        result.append({
+            "question": question,
+            "options": options,
+            "correct": item["correct"],
+        })
+
+    return result
+
+
+async def send_quiz(chat_id, quiz, context):
+    quiz = fit_telegram_limits(quiz)
+
+    if not quiz:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Is exercise mein valid questions nahi mile.",
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"✅ Quiz start ho raha hai!\nTotal Questions: {len(quiz)}",
+    )
+
+    sent = 0
+    failed = 0
+
+    for item in quiz:
+        try:
+            await context.bot.send_poll(
+                chat_id=chat_id,
+                question=item["question"],
+                options=item["options"],
+                type=PollType.QUIZ,
+                correct_option_id=item["correct"],
+                is_anonymous=False,
+            )
+
+            sent += 1
+            await asyncio.sleep(POLL_DELAY)
+
+        except Exception:
+            failed += 1
+            logger.exception("Poll send failed")
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "✅ Quiz completed!\n\n"
+            f"Sent: {sent}\n"
+            f"Failed: {failed}"
+        ),
+    )
 
 
 # ================= COMMANDS =================
 
+
+def is_authorized(update):
+    if OWNER_ID == 0:
+        return True
+
+    return (
+        update.effective_user
+        and update.effective_user.id == OWNER_ID
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
+    if not is_authorized(update):
         return
 
     await update.message.reply_text(
-        "📄 PDF QUIZ POLL MAKER\n\n"
-        "NEET/JEE MCQ PDF bhejiye.\n\n"
-        "Bot questions aur Answer Key read karke "
-        "Telegram Quiz Polls banayega.\n\n"
+        "👋 Welcome!\n\n"
+        "Send me a PDF file and I will convert its questions "
+        "into Telegram quiz polls.\n\n"
+        "Commands:\n"
+        "/start - Start bot\n"
         "/help - Help\n"
-        "/cancel - Process cancel"
+        "/cancel - Cancel selection"
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
+    if not is_authorized(update):
         return
 
     await update.message.reply_text(
-        "📚 PDF QUIZ BOT HELP\n\n"
-        "Supported formats:\n\n"
-        "Old format:\n"
-        "• Q1, Q2, Q3...\n"
-        "• (A), (B), (C), (D)\n"
-        "• Q1 B, Q2 D...\n\n"
-        "New format:\n"
-        "• 1., 2., 3...\n"
-        "• (1), (2), (3), (4)\n"
-        "• Que. ... Ans. ...\n\n"
-        "Exercise-wise selection supported.\n"
-        "/cancel - Cancel process"
+        "📚 PDF Quiz Bot Help\n\n"
+        "1. Send a PDF file.\n"
+        "2. Bot will extract questions and answer keys.\n"
+        "3. For exercise PDFs, select the exercise.\n"
+        "4. Select All Exercises to send every exercise.\n\n"
+        "Supported formats:\n"
+        "• Q1 with (A), (B), (C), (D)\n"
+        "• 1. with (1), (2), (3), (4)\n"
+        "• Que. / Ans. answer-key tables"
     )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
+    if not is_authorized(update):
         return
 
-    context.user_data["cancelled"] = True
-    context.user_data.pop("exercises", None)
-    context.user_data.pop("waiting_selection", None)
+    context.user_data.pop("pending_exercises", None)
 
     await update.message.reply_text(
-        "❌ Cancellation requested."
+        "❌ Current selection cancelled."
     )
+
+
+# ================= EXERCISE SELECTION =================
+
+
+async def show_exercise_selection(update, context, exercises):
+    context.user_data["pending_exercises"] = exercises
+
+    keyboard = []
+
+    for index, exercise in enumerate(exercises, start=1):
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{index}. {exercise['title']} ({len(exercise['questions'])})",
+                callback_data=f"exercise:{index}",
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            f"{len(exercises) + 1}. All Exercises",
+            callback_data="exercise:all",
+        )
+    ])
+
+    await update.message.reply_text(
+        "📚 PDF mein multiple exercises mili hain.\n\n"
+        "Kaunsi exercise ke polls chahiye?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def exercise_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    if OWNER_ID and query.from_user.id != OWNER_ID:
+        await query.answer(
+            "You are not authorized.",
+            show_alert=True,
+        )
+        return
+
+    exercises = context.user_data.get("pending_exercises")
+
+    if not exercises:
+        await query.edit_message_text(
+            "❌ Selection expire ho gaya. PDF dobara bhejein."
+        )
+        return
+
+    selection = query.data.split(":", 1)[1]
+
+    if selection == "all":
+        selected = exercises
+    else:
+        try:
+            index = int(selection) - 1
+            selected = [exercises[index]]
+        except (ValueError, IndexError):
+            await query.edit_message_text("❌ Invalid selection.")
+            return
+
+    context.user_data.pop("pending_exercises", None)
+
+    await query.edit_message_text("✅ Selection received. Quiz start ho raha hai...")
+
+    for exercise in selected:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                f"📖 {exercise['title']}\n"
+                f"Questions: {len(exercise['questions'])}"
+            ),
+        )
+
+        await send_quiz(
+            query.message.chat_id,
+            exercise["questions"],
+            context,
+        )
 
 
 # ================= PDF HANDLER =================
 
-async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    document = message.document
+
+async def handle_pdf(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_authorized(update):
+        return
+
+    document = update.message.document
 
     if not document:
         return
 
-    if not is_allowed(update.effective_user.id):
-        await message.reply_text(
-            "This bot is restricted to its owner."
+    filename = document.file_name or "document.pdf"
+
+    if not filename.lower().endswith(".pdf"):
+        await update.message.reply_text("❌ Please send a PDF file.")
+        return
+
+    file_size = document.file_size or 0
+
+    if file_size > MAX_PDF_MB * 1024 * 1024:
+        await update.message.reply_text(
+            f"❌ PDF size limit {MAX_PDF_MB} MB hai."
         )
         return
 
-    if not (document.file_name or "").lower().endswith(".pdf"):
-        await message.reply_text(
-            "Please PDF file send karein."
-        )
-        return
-
-    if document.file_size and document.file_size > MAX_PDF_MB * 1024 * 1024:
-        await message.reply_text(
-            f"PDF {MAX_PDF_MB} MB se chhoti honi chahiye."
-        )
-        return
-
-    context.user_data["cancelled"] = False
-
-    status = await message.reply_text(
+    status = await update.message.reply_text(
         "⏳ PDF download aur analysis ho raha hai..."
     )
 
@@ -597,262 +797,130 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         with tempfile.NamedTemporaryFile(
-            delete=False,
             suffix=".pdf",
-        ) as tmp:
-            temp_path = tmp.name
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
 
-        tg_file = await context.bot.get_file(document.file_id)
+        telegram_file = await context.bot.get_file(document.file_id)
 
-        await tg_file.download_to_drive(
+        await telegram_file.download_to_drive(
             custom_path=temp_path
         )
 
         pages = extract_pdf_pages(temp_path)
 
-        if context.user_data.get("cancelled"):
-            await status.edit_text("❌ Process cancelled.")
+        if not pages:
+            await status.edit_text("❌ PDF se text nahi mil paya.")
             return
 
-        exercises = build_exercises(pages)
+        full_text = "\n".join(pages)
 
-        if not exercises:
+        # New exercise format detection.
+        headings = find_exercise_headings(full_text)
+
+        if headings:
+            exercises = build_new_exercises(pages)
+
+            exercises = [
+                exercise
+                for exercise in exercises
+                if exercise["questions"]
+            ]
+
+            if not exercises:
+                await status.edit_text(
+                    "❌ Exercises detect hui, lekin questions aur "
+                    "answer keys match nahi ho paayi.\n\n"
+                    "Logs check karein."
+                )
+                return
+
+            await status.delete()
+
+            await show_exercise_selection(
+                update,
+                context,
+                exercises,
+            )
+
+            return
+
+        # If no exercise headings exist, use the old parser.
+        quiz = build_old_quiz(pages)
+
+        if not quiz:
             await status.edit_text(
-                "❌ Questions aur Answer Key match nahi hue.\n\n"
-                "Possible reasons:\n"
-                "• Question format detect nahi hua.\n"
-                "• Answer Key format detect nahi hua.\n"
-                "• Questions aur answers match nahi hue."
+                "❌ Questions aur answer key match nahi ho paaye."
             )
             return
-
-        context.user_data["exercises"] = exercises
-        context.user_data["waiting_selection"] = True
-
-        total_questions = sum(
-            len(ex["questions"])
-            for ex in exercises
-        )
-
-        lines = ["📚 PDF Exercises Found\n"]
-
-        for index, exercise in enumerate(exercises, start=1):
-            lines.append(
-                f"{index}. {exercise['name']} — "
-                f"{len(exercise['questions'])} Questions"
-            )
-
-        lines.append("")
-        lines.append(f"Total Exercises: {len(exercises)}")
-        lines.append(f"Total Matched Questions: {total_questions}")
-        lines.append("")
-        lines.append("Exercise select karo:")
-
-        for index in range(1, len(exercises) + 1):
-            lines.append(str(index))
-
-        all_option = len(exercises) + 1
-
-        lines.append(
-            f"{all_option}. All Exercises"
-        )
-
-        lines.append("")
-        lines.append("Reply mein sirf number likho.")
-
-        await status.edit_text("\n".join(lines))
-
-    except Exception as error:
-        log.exception("PDF processing error")
 
         await status.edit_text(
-            f"❌ Error: {str(error)[:250]}"
+            f"✅ Old-format PDF detected.\n"
+            f"Total matched questions: {len(quiz)}\n\n"
+            "Quiz start ho raha hai..."
         )
+
+        await send_quiz(
+            update.effective_chat.id,
+            quiz,
+            context,
+        )
+
+    except Exception:
+        logger.exception("PDF processing failed")
+
+        try:
+            await status.edit_text(
+                "❌ PDF process karte waqt error aa gaya.\n"
+                "Heroku logs check karein."
+            )
+        except Exception:
+            pass
 
     finally:
         if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-# ================= QUIZ SENDER =================
-
-async def send_exercise_polls(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    selected_exercises,
-):
-    total = sum(
-        len(ex["questions"])
-        for ex in selected_exercises
-    )
-
-    progress = await update.message.reply_text(
-        "🚀 Quiz banana start ho gaya!\n"
-        f"Total Questions: {total}"
-    )
-
-    sent = 0
-    failed = 0
-
-    for exercise in selected_exercises:
-        if context.user_data.get("cancelled"):
-            break
-
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                f"📚 {exercise['name']}\n"
-                f"Questions: {len(exercise['questions'])}"
-            ),
-        )
-
-        for question in exercise["questions"]:
-            if context.user_data.get("cancelled"):
-                break
-
             try:
-                await context.bot.send_poll(
-                    chat_id=update.effective_chat.id,
-                    question=question["question"],
-                    options=question["options"],
-                    type=PollType.QUIZ,
-                    correct_option_id=question["correct"],
-                    is_anonymous=True,
-                )
-
-                sent += 1
-
-            except TelegramError:
-                failed += 1
-
-                log.exception(
-                    "Poll failed for Q%s",
-                    question["number"],
-                )
-
-            if sent and sent % 5 == 0:
-                try:
-                    await progress.edit_text(
-                        f"📤 Polls sent: {sent}/{total}\n"
-                        f"❌ Failed: {failed}"
-                    )
-                except TelegramError:
-                    pass
-
-            await asyncio.sleep(POLL_DELAY)
-
-    if context.user_data.get("cancelled"):
-        await progress.edit_text(
-            "⚠️ Process cancelled.\n\n"
-            f"Polls sent: {sent}\n"
-            f"Failed: {failed}"
-        )
-    else:
-        await progress.edit_text(
-            "🎉 Quiz conversion completed!\n\n"
-            f"📤 Polls Sent: {sent}\n"
-            f"❌ Failed: {failed}\n"
-            f"📚 Exercises: {len(selected_exercises)}"
-        )
-
-    context.user_data.pop("exercises", None)
-    context.user_data.pop("waiting_selection", None)
-
-
-# ================= SELECTION HANDLER =================
-
-async def selection_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_allowed(update.effective_user.id):
-        return
-
-    if not context.user_data.get("waiting_selection"):
-        return
-
-    exercises = context.user_data.get("exercises")
-
-    if not exercises:
-        await update.message.reply_text(
-            "❌ Pehle PDF upload karo."
-        )
-        return
-
-    value = (update.message.text or "").strip()
-
-    if not re.fullmatch(r"\d+", value):
-        return
-
-    selection = int(value)
-
-    all_option = len(exercises) + 1
-
-    if selection < 1 or selection > all_option:
-        await update.message.reply_text(
-            f"❌ Invalid selection. 1 se {all_option} tak number bhejo."
-        )
-        return
-
-    context.user_data["waiting_selection"] = False
-
-    if selection == all_option:
-        selected = exercises
-    else:
-        selected = [exercises[selection - 1]]
-
-    await send_exercise_polls(
-        update,
-        context,
-        selected,
-    )
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 # ================= MAIN =================
 
+
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN environment variable missing"
-        )
+        raise RuntimeError("BOT_TOKEN config var missing!")
 
-    app = (
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .concurrent_updates(True)
         .build()
     )
 
-    app.add_handler(
-        CommandHandler("start", start)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("cancel", cancel))
+
+    application.add_handler(
+        CallbackQueryHandler(
+            exercise_callback,
+            pattern=r"^exercise:",
+        )
     )
 
-    app.add_handler(
-        CommandHandler("help", help_command)
-    )
-
-    app.add_handler(
-        CommandHandler("cancel", cancel)
-    )
-
-    app.add_handler(
+    application.add_handler(
         MessageHandler(
             filters.Document.PDF,
             handle_pdf,
         )
     )
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            selection_handler,
-        )
-    )
+    logger.info("PDF Quiz Bot Started")
 
-    log.info("PDF Quiz Poll Maker started")
-
-    app.run_polling(
-        drop_pending_updates=True
+    application.run_polling(
+        drop_pending_updates=True,
     )
 
 
