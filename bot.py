@@ -3,6 +3,8 @@ import re
 import asyncio
 import logging
 import tempfile
+import subprocess
+import shutil
 from pathlib import Path
 
 import fitz
@@ -32,40 +34,52 @@ logger = logging.getLogger(__name__)
 
 # ================= PDF TEXT EXTRACTION =================
 def extract_page_columns(page):
-    """Extract a two-column page in reading order, keeping full-width headings."""
-    blocks = page.get_text("blocks", sort=False)
-    middle = page.rect.width / 2
-    left, right, spanning = [], [], []
+    """Read the rendered page with Hindi+English OCR.
 
-    for block in blocks:
-        x0, y0, x1, y1, value, *_ = block
-        value = value.strip()
-        if not value:
-            continue
+    This Allen PDF uses a custom embedded font whose extracted text is legacy
+    glyph data (for example, "fuEu" instead of Devanagari). OCR reads the
+    visible Hindi characters and returns Unicode text suitable for Telegram.
+    """
+    if not shutil.which("tesseract"):
+        logger.warning("Tesseract not installed; falling back to PDF text extraction")
+        return page.get_text("text", sort=True)
 
-        item = (y0, x0, y1, value)
-        if x0 < middle - 10 and x1 > middle + 10:
-            spanning.append(item)
-        elif (x0 + x1) / 2 < middle:
-            left.append(item)
-        else:
-            right.append(item)
+    pix = page.get_pixmap(matrix=fitz.Matrix(1.8, 1.8), alpha=False)
+    image_bytes = pix.tobytes("png")
+    command = [
+        "tesseract", "stdin", "stdout", "-l", "hin+eng", "--psm", "3",
+        "-c", "preserve_interword_spaces=1",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            input=image_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.decode("utf-8", errors="replace")
+        logger.warning("OCR failed on page %s: %s", page.number + 1,
+                       result.stderr.decode("utf-8", errors="replace")[-500:])
+    except subprocess.TimeoutExpired:
+        logger.warning("OCR timed out on page %s", page.number + 1)
+    except Exception:
+        logger.exception("OCR error on page %s", page.number + 1)
 
-    left.sort(key=lambda item: (item[0], item[1]))
-    right.sort(key=lambda item: (item[0], item[1]))
-    spanning.sort(key=lambda item: (item[0], item[1]))
-
-    # Full-width blocks near the top are page/exercise headings.
-    top_blocks = [item for item in spanning if item[0] < 100]
-    bottom_blocks = [item for item in spanning if item[0] >= 100]
-
-    ordered = top_blocks + left + right + bottom_blocks
-    return "\n".join(item[3] for item in ordered)
+    return page.get_text("text", sort=True)
 
 
 def clean_text(text):
     text = text.replace("\x00", " ").replace("\u00a0", " ").replace("\ufeff", " ")
     text = text.replace("$//(1®", " ")
+    # OCR sometimes reads the printed digit 1 as capital I / lowercase l.
+    text = re.sub(r"(?m)^\s*[Il|]\.\s+", "1. ", text)
+    text = re.sub(r"(?<!\S)\((?:I|l|॥)\)(?=\s)", "(1)", text)
+    # Convert Devanagari digits to ASCII for question numbers and answer keys.
+    devanagari_digits = "०१२३४५६७८९"
+    text = text.translate(str.maketrans(devanagari_digits, "0123456789"))
     lines = []
     for line in text.splitlines():
         line = re.sub(r"[ \t]+", " ", line).strip()
