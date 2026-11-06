@@ -4,10 +4,14 @@ import re
 import asyncio
 import logging
 import tempfile
-from pathlib import Path
 
 import fitz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.constants import PollType
 from telegram.ext import (
     Application,
@@ -30,10 +34,11 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
 logger = logging.getLogger(__name__)
 
-# ================= TEXT EXTRACTION =================
 
+# ================= TEXT EXTRACTION =================
 
 def clean_text(text):
     text = text.replace("\x00", " ")
@@ -48,7 +53,6 @@ def clean_text(text):
         if not line:
             continue
 
-        # PDF page footer/header cleanup
         if re.fullmatch(r"\$//\(1®?", line):
             continue
 
@@ -62,8 +66,7 @@ def clean_text(text):
 
 def extract_page_columns(page):
     """
-    Extract left column first, then right column.
-    This preserves the reading order of the Allen PDF.
+    Extract left column first and then right column.
     """
 
     words = page.get_text("words", sort=False)
@@ -75,8 +78,8 @@ def extract_page_columns(page):
 
     for word in words:
         x0, y0, x1, y1, value, block_no, line_no, word_no = word
-        key = (block_no, line_no)
 
+        key = (block_no, line_no)
         grouped.setdefault(key, []).append(word)
 
     left_lines = []
@@ -88,6 +91,7 @@ def extract_page_columns(page):
         items.sort(key=lambda x: x[7])
 
         line_text = " ".join(item[4] for item in items)
+
         x0 = min(item[0] for item in items)
         y0 = min(item[1] for item in items)
 
@@ -117,23 +121,13 @@ def extract_pdf_pages(pdf_path):
 
     with fitz.open(pdf_path) as pdf:
         for page in pdf:
-            pages.append(clean_text(extract_page_columns(page)))
+            text = extract_page_columns(page)
+            pages.append(clean_text(text))
 
     return pages
 
 
 # ================= OLD PDF FORMAT =================
-# Supports:
-# Q1. Question
-# (A) Option
-# (B) Option
-# (C) Option
-# (D) Option
-#
-# Answer key:
-# Q1 B
-# Q2 D
-
 
 def parse_old_answer_key(text):
     answers = {}
@@ -192,13 +186,27 @@ def parse_old_questions(text):
                 else len(block)
             )
 
-            option_text = block[option_start:option_end].strip()
-            option_text = re.sub(r"\s+", " ", option_text)
+            option_text = block[
+                option_start:option_end
+            ].strip()
+
+            option_text = re.sub(
+                r"\s+",
+                " ",
+                option_text,
+            )
 
             options.append(option_text)
 
-        question_text = block[:option_matches[0].start()].strip()
-        question_text = re.sub(r"\s+", " ", question_text)
+        question_text = block[
+            :option_matches[0].start()
+        ].strip()
+
+        question_text = re.sub(
+            r"\s+",
+            " ",
+            question_text,
+        )
 
         if not question_text:
             continue
@@ -224,8 +232,13 @@ def build_old_quiz(pages):
         logger.warning("Old-format Answer Key not found")
         return []
 
-    question_text = full_text[:answer_key_match.start()]
-    answer_text = full_text[answer_key_match.start():]
+    question_text = full_text[
+        :answer_key_match.start()
+    ]
+
+    answer_text = full_text[
+        answer_key_match.start():
+    ]
 
     questions = parse_old_questions(question_text)
     answers = parse_old_answer_key(answer_text)
@@ -252,20 +265,9 @@ def build_old_quiz(pages):
 
 
 # ================= NEW PDF FORMAT =================
-# Supports:
-# 1. Question
-# (1) Option
-# (2) Option
-# (3) Option
-# (4) Option
-#
-# Answer key:
-# Que. 1 2 3 4
-# Ans. 3 2 1 4
-
 
 def normalize_exercise_number(value):
-    value = value.upper()
+    value = value.upper().strip()
 
     mapping = {
         "I": 1,
@@ -280,60 +282,210 @@ def normalize_exercise_number(value):
 
 
 def find_exercise_headings(text):
+    """
+    Supports:
+    EXERCISE-I
+    EXERCISE - I
+    EXERCISE II
+    EXERCISE-III
+    EXERCISE 1
+    """
+
     pattern = re.compile(
-        r"(?im)^\s*EXERCISE\s*[-–]?\s*(III|II|I|[123])\b[^\n]*"
+        r"(?im)^\s*EXERCISE\s*[-–—]?\s*"
+        r"(III|II|I|[123])\b[^\n]*"
     )
 
     headings = []
 
     for match in pattern.finditer(text):
-        number = normalize_exercise_number(match.group(1))
+        number = normalize_exercise_number(
+            match.group(1)
+        )
 
-        if number:
+        if not number:
+            continue
+
+        line = match.group(0).strip()
+
+        is_key = bool(
+            re.search(
+                r"ANSWER\s*[-–—]?\s*KEY",
+                line,
+                re.IGNORECASE,
+            )
+        )
+
+        headings.append({
+            "number": number,
+            "start": match.start(),
+            "end": match.end(),
+            "line": line,
+            "is_key": is_key,
+        })
+
+    # Fallback: heading may have leading text on its line.
+    if not headings:
+        fallback = re.compile(
+            r"(?im)EXERCISE\s*[-–—]?\s*"
+            r"(III|II|I|[123])\b[^\n]*"
+        )
+
+        for match in fallback.finditer(text):
+            number = normalize_exercise_number(
+                match.group(1)
+            )
+
+            if not number:
+                continue
+
+            line = match.group(0).strip()
+
             headings.append({
                 "number": number,
                 "start": match.start(),
                 "end": match.end(),
-                "line": match.group(0),
+                "line": line,
                 "is_key": bool(
-                    re.search(r"ANSWER\s*KEY", match.group(0), re.I)
+                    re.search(
+                        r"ANSWER\s*[-–—]?\s*KEY",
+                        line,
+                        re.IGNORECASE,
+                    )
                 ),
             })
+
+    # Remove duplicate heading positions.
+    unique = {}
+    for heading in headings:
+        unique[heading["start"]] = heading
+
+    headings = sorted(
+        unique.values(),
+        key=lambda x: x["start"],
+    )
+
+    for heading in headings:
+        logger.info(
+            "Heading detected: Exercise %s | key=%s | %s",
+            heading["number"],
+            heading["is_key"],
+            heading["line"],
+        )
 
     return headings
 
 
 def parse_new_answer_key(text):
     """
-    Reads Que. and Ans. rows, including rows split across lines.
+    Reads answer tables such as:
+
+    Que. 1 2 3 4 5
+    Ans. 1 2 3 4 1
+
+    Also supports wrapped Que/Ans rows.
     """
 
     answers = {}
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
 
     question_numbers = []
+    answer_mode = False
+    answer_values = []
+
+    def save_answers():
+        nonlocal question_numbers, answer_values
+
+        if question_numbers and answer_values:
+            for qno, answer in zip(
+                question_numbers,
+                answer_values,
+            ):
+                if answer in (1, 2, 3, 4):
+                    answers[qno] = answer - 1
+
+        question_numbers = []
+        answer_values = []
 
     for line in lines:
-        que_match = re.match(r"(?i)^Que\.?\s*(.*)$", line)
 
-        if que_match:
-            question_numbers = [
-                int(x) for x in re.findall(r"\d+", que_match.group(1))
-            ]
+        # Ignore unrelated headings.
+        if re.search(
+            r"EXERCISE\s*[-–—]?\s*(III|II|I|[123])",
+            line,
+            re.IGNORECASE,
+        ):
+            save_answers()
+            answer_mode = False
             continue
 
-        ans_match = re.match(r"(?i)^Ans\.?\s*(.*)$", line)
+        que_match = re.match(
+            r"(?i)^Que\.?\s*(.*)$",
+            line,
+        )
 
-        if ans_match and question_numbers:
-            answer_values = [
-                int(x) for x in re.findall(r"\b[1-4]\b", ans_match.group(1))
+        if que_match:
+            save_answers()
+
+            question_numbers = [
+                int(x)
+                for x in re.findall(
+                    r"\d+",
+                    que_match.group(1),
+                )
             ]
 
-            for qno, answer in zip(question_numbers, answer_values):
-                answers[qno] = answer - 1
+            answer_mode = False
+            continue
 
-            question_numbers = []
+        ans_match = re.match(
+            r"(?i)^Ans\.?\s*(.*)$",
+            line,
+        )
+
+        if ans_match:
+            answer_values = [
+                int(x)
+                for x in re.findall(
+                    r"\b[1-4]\b",
+                    ans_match.group(1),
+                )
+            ]
+
+            answer_mode = True
+            continue
+
+        # Continuation of a wrapped Que row.
+        if question_numbers and not answer_mode:
+            if re.fullmatch(r"[\d\s]+", line):
+                question_numbers.extend(
+                    int(x)
+                    for x in re.findall(r"\d+", line)
+                )
+                continue
+
+        # Continuation of a wrapped Ans row.
+        if answer_mode:
+            if re.fullmatch(r"[\d\s]+", line):
+                answer_values.extend(
+                    int(x)
+                    for x in re.findall(
+                        r"\b[1-4]\b",
+                        line,
+                    )
+                )
+                continue
+
+            # Stop if another unrelated line begins.
+            save_answers()
+            answer_mode = False
+
+    save_answers()
 
     return answers
 
@@ -358,14 +510,14 @@ def parse_new_questions(text):
 
         block = text[start:end].strip()
 
-        # Locate the four numbered options.
         option_pattern = re.compile(
-            r"\(([1-4])\)\s*"
+            r"(?m)^\s*\(([1-4])\)\s*"
         )
 
-        option_matches = list(option_pattern.finditer(block))
+        option_matches = list(
+            option_pattern.finditer(block)
+        )
 
-        # Keep the first occurrence of each option label.
         selected = []
         seen = set()
 
@@ -384,14 +536,23 @@ def parse_new_questions(text):
 
         selected.sort(key=lambda x: x.start())
 
-        # Ensure options are in 1, 2, 3, 4 order.
-        labels = [int(x.group(1)) for x in selected]
+        labels = [
+            int(x.group(1))
+            for x in selected
+        ]
 
         if labels != [1, 2, 3, 4]:
             continue
 
-        question_text = block[:selected[0].start()].strip()
-        question_text = re.sub(r"\s+", " ", question_text)
+        question_text = block[
+            :selected[0].start()
+        ].strip()
+
+        question_text = re.sub(
+            r"\s+",
+            " ",
+            question_text,
+        )
 
         options = []
 
@@ -404,10 +565,16 @@ def parse_new_questions(text):
                 else len(block)
             )
 
-            option_text = block[option_start:option_end].strip()
-            option_text = re.sub(r"\s+", " ", option_text)
+            option_text = block[
+                option_start:option_end
+            ].strip()
 
-            # Remove question IDs such as CC0001 from option endings.
+            option_text = re.sub(
+                r"\s+",
+                " ",
+                option_text,
+            )
+
             option_text = re.sub(
                 r"\bCC\d{3,}\b",
                 "",
@@ -416,7 +583,10 @@ def parse_new_questions(text):
 
             options.append(option_text)
 
-        if not question_text or any(not x for x in options):
+        if not question_text:
+            continue
+
+        if any(not option for option in options):
             continue
 
         questions.append({
@@ -430,17 +600,20 @@ def parse_new_questions(text):
 
 def build_new_exercises(pages):
     full_text = "\n".join(pages)
+
     headings = find_exercise_headings(full_text)
 
     if not headings:
         logger.warning("No exercise headings found")
         return []
 
-    # Group headings by exercise number.
     grouped = {}
 
     for heading in headings:
-        grouped.setdefault(heading["number"], []).append(heading)
+        grouped.setdefault(
+            heading["number"],
+            [],
+        ).append(heading)
 
     exercises = []
 
@@ -463,12 +636,18 @@ def build_new_exercises(pages):
             )
             continue
 
-        # Questions are between exercise title and its answer-key heading.
+        if key_heading["start"] <= title_heading["start"]:
+            logger.warning(
+                "Exercise %s: invalid heading order",
+                number,
+            )
+            continue
+
         question_section = full_text[
-            title_heading["end"]:key_heading["start"]
+            title_heading["end"]:
+            key_heading["start"]
         ]
 
-        # Answer key continues until the next exercise title.
         next_title = None
 
         for other_number, other_entries in grouped.items():
@@ -477,17 +656,30 @@ def build_new_exercises(pages):
 
             for entry in other_entries:
                 if not entry["is_key"]:
-                    if next_title is None or entry["start"] < next_title["start"]:
+                    if (
+                        next_title is None
+                        or entry["start"] < next_title["start"]
+                    ):
                         next_title = entry
 
-        key_end = next_title["start"] if next_title else len(full_text)
+        key_end = (
+            next_title["start"]
+            if next_title
+            else len(full_text)
+        )
 
         answer_section = full_text[
-            key_heading["end"]:key_end
+            key_heading["end"]:
+            key_end
         ]
 
-        questions = parse_new_questions(question_section)
-        answers = parse_new_answer_key(answer_section)
+        questions = parse_new_questions(
+            question_section
+        )
+
+        answers = parse_new_answer_key(
+            answer_section
+        )
 
         matched = []
 
@@ -525,16 +717,7 @@ def build_new_exercises(pages):
 
 # ================= TELEGRAM POLL HELPERS =================
 
-
 def fit_telegram_limits(quiz):
-    """
-    Telegram limits:
-    Question: 300 characters
-    Option: 100 characters
-
-    Long questions/options are shortened instead of being discarded.
-    """
-
     result = []
 
     for item in quiz:
@@ -586,7 +769,10 @@ async def send_quiz(chat_id, quiz, context):
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"✅ Quiz start ho raha hai!\nTotal Questions: {len(quiz)}",
+        text=(
+            "✅ Quiz start ho raha hai!\n"
+            f"Total Questions: {len(quiz)}"
+        ),
     )
 
     sent = 0
@@ -620,20 +806,24 @@ async def send_quiz(chat_id, quiz, context):
     )
 
 
-# ================= COMMANDS =================
-
+# ================= AUTHORIZATION =================
 
 def is_authorized(update):
     if OWNER_ID == 0:
         return True
 
-    return (
+    return bool(
         update.effective_user
         and update.effective_user.id == OWNER_ID
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= COMMANDS =================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not is_authorized(update):
         return
 
@@ -648,7 +838,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not is_authorized(update):
         return
 
@@ -665,11 +858,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not is_authorized(update):
         return
 
-    context.user_data.pop("pending_exercises", None)
+    context.user_data.pop(
+        "pending_exercises",
+        None,
+    )
 
     await update.message.reply_text(
         "❌ Current selection cancelled."
@@ -678,16 +877,25 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= EXERCISE SELECTION =================
 
-
-async def show_exercise_selection(update, context, exercises):
+async def show_exercise_selection(
+    update,
+    context,
+    exercises,
+):
     context.user_data["pending_exercises"] = exercises
 
     keyboard = []
 
-    for index, exercise in enumerate(exercises, start=1):
+    for index, exercise in enumerate(
+        exercises,
+        start=1,
+    ):
         keyboard.append([
             InlineKeyboardButton(
-                f"{index}. {exercise['title']} ({len(exercise['questions'])})",
+                (
+                    f"{index}. {exercise['title']} "
+                    f"({len(exercise['questions'])})"
+                ),
                 callback_data=f"exercise:{index}",
             )
         ])
@@ -711,7 +919,6 @@ async def exercise_callback(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
-    await query.answer()
 
     if OWNER_ID and query.from_user.id != OWNER_ID:
         await query.answer(
@@ -720,7 +927,11 @@ async def exercise_callback(
         )
         return
 
-    exercises = context.user_data.get("pending_exercises")
+    await query.answer()
+
+    exercises = context.user_data.get(
+        "pending_exercises"
+    )
 
     if not exercises:
         await query.edit_message_text(
@@ -736,13 +947,21 @@ async def exercise_callback(
         try:
             index = int(selection) - 1
             selected = [exercises[index]]
+
         except (ValueError, IndexError):
-            await query.edit_message_text("❌ Invalid selection.")
+            await query.edit_message_text(
+                "❌ Invalid selection."
+            )
             return
 
-    context.user_data.pop("pending_exercises", None)
+    context.user_data.pop(
+        "pending_exercises",
+        None,
+    )
 
-    await query.edit_message_text("✅ Selection received. Quiz start ho raha hai...")
+    await query.edit_message_text(
+        "✅ Selection received. Quiz start ho raha hai..."
+    )
 
     for exercise in selected:
         await context.bot.send_message(
@@ -762,7 +981,6 @@ async def exercise_callback(
 
 # ================= PDF HANDLER =================
 
-
 async def handle_pdf(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -778,7 +996,9 @@ async def handle_pdf(
     filename = document.file_name or "document.pdf"
 
     if not filename.lower().endswith(".pdf"):
-        await update.message.reply_text("❌ Please send a PDF file.")
+        await update.message.reply_text(
+            "❌ Please send a PDF file."
+        )
         return
 
     file_size = document.file_size or 0
@@ -802,7 +1022,9 @@ async def handle_pdf(
         ) as temp_file:
             temp_path = temp_file.name
 
-        telegram_file = await context.bot.get_file(document.file_id)
+        telegram_file = await context.bot.get_file(
+            document.file_id
+        )
 
         await telegram_file.download_to_drive(
             custom_path=temp_path
@@ -811,16 +1033,21 @@ async def handle_pdf(
         pages = extract_pdf_pages(temp_path)
 
         if not pages:
-            await status.edit_text("❌ PDF se text nahi mil paya.")
+            await status.edit_text(
+                "❌ PDF se text nahi mil paya."
+            )
             return
 
         full_text = "\n".join(pages)
 
-        # New exercise format detection.
-        headings = find_exercise_headings(full_text)
+        headings = find_exercise_headings(
+            full_text
+        )
 
         if headings:
-            exercises = build_new_exercises(pages)
+            exercises = build_new_exercises(
+                pages
+            )
 
             exercises = [
                 exercise
@@ -830,9 +1057,9 @@ async def handle_pdf(
 
             if not exercises:
                 await status.edit_text(
-                    "❌ Exercises detect hui, lekin questions aur "
-                    "answer keys match nahi ho paayi.\n\n"
-                    "Logs check karein."
+                    "❌ Exercises detect hui, lekin questions "
+                    "aur answer keys match nahi ho paayi.\n\n"
+                    "Heroku logs check karein."
                 )
                 return
 
@@ -846,7 +1073,7 @@ async def handle_pdf(
 
             return
 
-        # If no exercise headings exist, use the old parser.
+        # Old PDF format fallback.
         quiz = build_old_quiz(pages)
 
         if not quiz:
@@ -856,7 +1083,7 @@ async def handle_pdf(
             return
 
         await status.edit_text(
-            f"✅ Old-format PDF detected.\n"
+            "✅ Old-format PDF detected.\n"
             f"Total matched questions: {len(quiz)}\n\n"
             "Quiz start ho raha hai..."
         )
@@ -868,7 +1095,9 @@ async def handle_pdf(
         )
 
     except Exception:
-        logger.exception("PDF processing failed")
+        logger.exception(
+            "PDF processing failed"
+        )
 
         try:
             await status.edit_text(
@@ -888,10 +1117,11 @@ async def handle_pdf(
 
 # ================= MAIN =================
 
-
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN config var missing!")
+        raise RuntimeError(
+            "BOT_TOKEN config var missing!"
+        )
 
     application = (
         Application.builder()
@@ -899,9 +1129,17 @@ def main():
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("cancel", cancel)
+    )
 
     application.add_handler(
         CallbackQueryHandler(
@@ -917,7 +1155,9 @@ def main():
         )
     )
 
-    logger.info("PDF Quiz Bot Started")
+    logger.info(
+        "PDF Quiz Bot Started"
+    )
 
     application.run_polling(
         drop_pending_updates=True,
