@@ -3,434 +3,440 @@ import os
 import re
 import asyncio
 import logging
-import tempfile
-from pathlib import Path
-from collections import defaultdict
+from io import BytesIO
 
 import fitz
 from telegram import Update
 from telegram.constants import PollType
+from telegram.error import TelegramError
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+# ================= CONFIG =================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 MAX_PDF_MB = int(os.getenv("MAX_PDF_MB", "20"))
 POLL_DELAY = float(os.getenv("POLL_DELAY", "1.2"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
-log = logging.getLogger("pdf-quiz-poll-maker")
+# ================= PDF TEXT =================
 
-
-def clean_text(text):
-    text = text.replace("\u00a0", " ")
-    text = text.replace("\uf0b7", " ")
-    text = text.replace("\u200b", "")
-
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
-
-
-def extract_page_columns(page):
-    """
-    Extract PDF text column-wise.
-    Left column first, then right column.
-    """
-
-    words = page.get_text("words", sort=False)
-
-    lines = defaultdict(list)
-
-    for word in words:
-        x0, y0, x1, y1, text, block_no, line_no, word_no = word[:8]
-
-        key = (block_no, line_no)
-
-        lines[key].append({
-            "x": x0,
-            "y": y0,
-            "text": text,
-        })
-
-    left = []
-    right = []
-
-    middle = page.rect.width / 2
-
-    for line_words in lines.values():
-
-        line_words.sort(key=lambda x: x["x"])
-
-        line_text = " ".join(
-            item["text"] for item in line_words
-        )
-
-        line_text = clean_text(line_text)
-
-        if not line_text:
-            continue
-
-        x = min(item["x"] for item in line_words)
-        y = min(item["y"] for item in line_words)
-
-        item = (y, x, line_text)
-
-        if x < middle:
-            left.append(item)
-        else:
-            right.append(item)
-
-    left.sort(key=lambda x: (x[0], x[1]))
-    right.sort(key=lambda x: (x[0], x[1]))
-
-    output = []
-
-    for _, _, text in left:
-        output.append(text)
-
-    output.append("")
-
-    for _, _, text in right:
-        output.append(text)
-
-    return "\n".join(output)
-
-
-def extract_pdf_pages(path):
-
-    doc = fitz.open(path)
-
+def extract_pdf_text(pdf_bytes):
+    """Extract selectable text from PDF."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
 
     for page in doc:
-        pages.append(extract_page_columns(page))
+        # Sorted extraction helps with normal and many two-column PDFs.
+        pages.append(page.get_text("text", sort=True))
 
     doc.close()
+    return "\n".join(pages)
 
-    return pages
 
+def clean_text(text):
+    text = text.replace("\x00", " ")
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\bCC\d{3,}\b", "", text)
+    text = re.sub(r"\b[A-Z]{2,5}\d{3,}\b", "", text)
+    return text.strip(" \n\t.-")
+
+
+# ================= ANSWER KEY =================
 
 def parse_answer_key(text):
-
     answers = {}
 
+    # Format:
+    # Que. 1 2 3 4 5
+    # Ans. 3 2 1 4 2
+
     pattern = re.compile(
-        r"\bQ\s*(\d{1,3})\s*[\.\):\-]?\s*([A-D])\b",
-        re.IGNORECASE
+        r"\bQue\.?\s*(.*?)\bAns\.?\s*(.*?)(?=\bQue\.?|$)",
+        re.IGNORECASE | re.DOTALL,
     )
 
     for match in pattern.finditer(text):
+        question_part = match.group(1)
+        answer_part = match.group(2)
 
-        number = int(match.group(1))
-        answer = match.group(2).upper()
+        questions = re.findall(r"\d+", question_part)
+        values = re.findall(
+            r"(?<![A-Za-z0-9])([1-4]|[A-D])(?![A-Za-z0-9])",
+            answer_part,
+            re.IGNORECASE,
+        )
 
-        if 1 <= number <= 300:
-            answers[number] = answer
+        for q, ans in zip(questions, values):
+            answers[int(q)] = ans.upper()
+
+    # Other common formats:
+    # 1. B
+    # 2. C
+    # 3. 4
+
+    if not answers:
+        for match in re.finditer(
+            r"(?m)^\s*(\d{1,3})\s*[.)\-:]\s*\(?([1-4]|[A-D])\)?\s*$",
+            text,
+            re.IGNORECASE,
+        ):
+            answers[int(match.group(1))] = match.group(2).upper()
 
     return answers
 
 
-def parse_questions(text):
+def answer_to_index(answer):
+    if not answer:
+        return None
 
+    answer = str(answer).strip().upper()
+
+    if answer in ("A", "B", "C", "D"):
+        return ord(answer) - ord("A")
+
+    if answer in ("1", "2", "3", "4"):
+        return int(answer) - 1
+
+    return None
+
+
+# ================= QUESTION PARSER =================
+
+def parse_questions(text, answer_key):
     questions = []
 
-    question_pattern = re.compile(
-        r"(?im)^\s*Q\s*(\d{1,3})\s*"
+    # Question starts:
+    # 1. Question text
+    # 2) Question text
+
+    starts = list(
+        re.finditer(
+            r"(?m)^\s*(\d{1,3})\s*[.)]\s+",
+            text,
+        )
     )
 
-    question_matches = list(
-        question_pattern.finditer(text)
-    )
+    for i, start in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(text)
+        block = text[start.start():end]
 
-    option_pattern = re.compile(
-        r"\(([A-D])\)\s*",
-        re.IGNORECASE
-    )
+        question_number = int(start.group(1))
 
-    for index, match in enumerate(question_matches):
-
-        number = int(match.group(1))
-
-        start = match.end()
-
-        if index + 1 < len(question_matches):
-            end = question_matches[index + 1].start()
-        else:
-            end = len(text)
-
-        content = text[start:end].strip()
-
-        # Remove PDF footer text
-        content = re.sub(
-            r"Android App\s*\|.*",
+        # Remove question number.
+        block = re.sub(
+            r"^\s*\d{1,3}\s*[.)]\s*",
             "",
-            content,
-            flags=re.IGNORECASE
+            block,
+            count=1,
         )
 
-        content = re.sub(
-            r"iOS App|PW Website",
-            "",
-            content,
-            flags=re.IGNORECASE
-        )
+        # Supports both:
+        # (A), (B), (C), (D)
+        # (1), (2), (3), (4)
 
         option_matches = list(
-            option_pattern.finditer(content)
+            re.finditer(
+                r"\(([1-4]|[A-D])\)\s*",
+                block,
+                re.IGNORECASE,
+            )
         )
 
         if len(option_matches) < 4:
             continue
 
-        question_text = content[:option_matches[0].start()]
+        option_matches = option_matches[:4]
 
-        options = {}
+        question_text = clean_text(block[:option_matches[0].start()])
 
-        for i, option_match in enumerate(option_matches):
-
-            letter = option_match.group(1).upper()
-
-            option_start = option_match.end()
-
-            if i + 1 < len(option_matches):
-                option_end = option_matches[i + 1].start()
-            else:
-                option_end = len(content)
-
-            option_text = content[option_start:option_end]
-
-            option_text = clean_text(option_text)
-
-            # Avoid duplicate option labels
-            if letter not in options:
-                options[letter] = option_text
-
-        question_text = clean_text(question_text)
-
-        if not all(x in options for x in "ABCD"):
-            continue
-
-        final_options = [
-            options["A"],
-            options["B"],
-            options["C"],
-            options["D"],
-        ]
-
-        # Telegram poll limits
         if not question_text:
             continue
 
-        if len(question_text) > 300:
-            log.warning(
-                "Question %s exceeds Telegram limit",
-                number
+        options = []
+
+        for j, option_match in enumerate(option_matches):
+            option_start = option_match.end()
+
+            option_end = (
+                option_matches[j + 1].start()
+                if j + 1 < len(option_matches)
+                else len(block)
             )
+
+            option_text = clean_text(block[option_start:option_end])
+            options.append(option_text)
+
+        if len(options) != 4 or any(not option for option in options):
             continue
 
-        if any(
-            not option or len(option) > 100
-            for option in final_options
-        ):
-            log.warning(
-                "Question %s has invalid options",
-                number
-            )
+        answer = answer_key.get(question_number)
+        correct_index = answer_to_index(answer)
+
+        if correct_index is None:
+            continue
+
+        if correct_index > 3:
             continue
 
         questions.append({
-            "number": number,
-            "question": question_text,
-            "options": final_options,
+            "number": question_number,
+            "question": question_text[:300],
+            "options": [option[:100] for option in options],
+            "correct": correct_index,
         })
 
     return questions
 
 
-def build_quiz(pages):
+# ================= EXERCISE DETECTION =================
 
-    answer_page_index = None
+EXERCISE_PATTERN = re.compile(
+    r"(?im)^\s*EXERCISE\s*[-–—]?\s*"
+    r"([IVXLCDM]+|\d+)\s*"
+    r"\(([^)\n]{2,100})\)",
+)
 
-    for index, page_text in enumerate(pages):
 
-        if re.search(
-            r"Answer\s*Key",
-            page_text,
-            re.IGNORECASE
-        ):
-            answer_page_index = index
-            break
+def detect_exercises(text):
+    matches = list(EXERCISE_PATTERN.finditer(text))
+    exercises = []
 
-    if answer_page_index is None:
-        return [], 0, 0
+    if not matches:
+        # Old PDF format without exercise headings.
+        key_match = re.search(
+            r"ANSWER\s*KEY",
+            text,
+            re.IGNORECASE,
+        )
 
-    # Questions before Answer Key only
-    question_pages = pages[:answer_page_index]
+        if key_match:
+            question_text = text[:key_match.start()]
+            key_text = text[key_match.start():]
+        else:
+            question_text = text
+            key_text = ""
 
-    # Answer Key page
-    answer_text = pages[answer_page_index]
+        answer_key = parse_answer_key(key_text)
+        questions = parse_questions(question_text, answer_key)
 
-    questions_text = "\n".join(question_pages)
+        if questions:
+            exercises.append({
+                "name": "All Questions",
+                "questions": questions,
+            })
 
-    questions = parse_questions(questions_text)
+        return exercises
 
-    answers = parse_answer_key(answer_text)
+    for i, match in enumerate(matches):
+        exercise_number = match.group(1).upper()
+        exercise_name = match.group(2).strip()
 
-    matched = []
+        start = match.end()
+        end = (
+            matches[i + 1].start()
+            if i + 1 < len(matches)
+            else len(text)
+        )
 
-    for question in questions:
+        section = text[start:end]
 
-        number = question["number"]
+        # Locate this exercise's answer key.
+        key_match = re.search(
+            r"ANSWER\s*KEY",
+            section,
+            re.IGNORECASE,
+        )
 
-        answer = answers.get(number)
+        if key_match:
+            question_text = section[:key_match.start()]
+            key_text = section[key_match.start():]
+        else:
+            question_text = section
+            key_text = ""
 
-        if not answer:
-            continue
+        answer_key = parse_answer_key(key_text)
+        questions = parse_questions(question_text, answer_key)
 
-        if answer not in "ABCD":
-            continue
+        if questions:
+            exercises.append({
+                "name": f"Exercise-{exercise_number} ({exercise_name})",
+                "questions": questions,
+            })
 
-        question["correct"] = "ABCD".index(answer)
+    return exercises
 
-        matched.append(question)
 
-    matched.sort(key=lambda q: q["number"])
+# ================= ACCESS CONTROL =================
 
-    return matched, len(questions), len(answers)
+def is_allowed(user_id):
+    return OWNER_ID == 0 or user_id == OWNER_ID
 
+
+# ================= COMMANDS =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
 
     await update.message.reply_text(
-        "📄 PDF QUIZ POLL MAKER\n\n"
-        "NEET/JEE MCQ PDF bhejiye.\n\n"
-        "Bot PDF se questions aur Answer Key read karke "
-        "Telegram Quiz Polls banayega.\n\n"
+        "👋 Welcome to PDF Quiz Bot!\n\n"
+        "📄 Mujhe MCQ PDF bhejo.\n"
+        "Main automatically questions aur answer key detect karke "
+        "Telegram Quiz Polls bana dunga.\n\n"
         "/help - Help\n"
-        "/cancel - Process cancel"
+        "/cancel - Cancel current PDF"
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
 
     await update.message.reply_text(
-        "📚 Supported PDF Format\n\n"
-        "• Questions: Q1, Q2, Q3...\n"
-        "• Options: (A), (B), (C), (D)\n"
-        "• Answer Key: Q1 B, Q2 D...\n\n"
-        "Two-column PDFs supported.\n"
-        "Answer Key page questions ke baad honi chahiye."
+        "📚 PDF QUIZ BOT HELP\n\n"
+        "1. PDF upload karo.\n"
+        "2. Bot exercises detect karega.\n"
+        "3. Exercise number select karo.\n"
+        "4. 4 select karne par all exercises ke polls banenge.\n\n"
+        "Supported formats:\n"
+        "• Old Q1 / (A), (B), (C), (D)\n"
+        "• New 1. / (1), (2), (3), (4)\n\n"
+        "/cancel - Current process cancel"
     )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    context.user_data["cancelled"] = True
-
-    await update.message.reply_text(
-        "❌ Cancellation requested."
-    )
-
-
-async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    message = update.message
-
-    document = message.document
-
-    if not document:
+    if not is_allowed(update.effective_user.id):
         return
 
-    if not (document.file_name or "").lower().endswith(".pdf"):
-        await message.reply_text("Please PDF file send karein.")
+    context.user_data.pop("exercises", None)
+    context.user_data.pop("waiting_selection", None)
+
+    await update.message.reply_text("❌ Current process cancelled.")
+
+
+# ================= PDF HANDLER =================
+
+async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_allowed(user_id):
         return
 
-    if document.file_size and document.file_size > MAX_PDF_MB * 1024 * 1024:
+    document = update.message.document
 
-        await message.reply_text(
-            f"PDF {MAX_PDF_MB} MB se chhoti honi chahiye."
+    if not document.file_name.lower().endswith(".pdf"):
+        await update.message.reply_text("❌ Please send a PDF file.")
+        return
+
+    max_size = MAX_PDF_MB * 1024 * 1024
+
+    if document.file_size and document.file_size > max_size:
+        await update.message.reply_text(
+            f"❌ PDF too large. Maximum size: {MAX_PDF_MB} MB"
         )
-
         return
 
-    if OWNER_ID and update.effective_user.id != OWNER_ID:
-
-        await message.reply_text(
-            "This bot is restricted to its owner."
-        )
-
-        return
-
-    context.user_data["cancelled"] = False
-
-    status = await message.reply_text(
-        "⏳ PDF download aur analysis ho raha hai..."
+    status = await update.message.reply_text(
+        "⏳ PDF read ho rahi hai...\nPlease wait."
     )
-
-    temp_path = None
 
     try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        pdf_bytes = await telegram_file.download_as_bytearray()
 
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".pdf"
-        ) as tmp:
+        text = extract_pdf_text(bytes(pdf_bytes))
 
-            temp_path = tmp.name
-
-        tg_file = await context.bot.get_file(
-            document.file_id
-        )
-
-        await tg_file.download_to_drive(
-            custom_path=temp_path
-        )
-
-        pages = extract_pdf_pages(temp_path)
-
-        if context.user_data.get("cancelled"):
-            await status.edit_text("❌ Process cancelled.")
-            return
-
-        quizzes, total_found, key_count = build_quiz(pages)
-
-        if not quizzes:
-
+        if not text.strip():
             await status.edit_text(
-                "❌ Questions aur Answer Key match nahi hue.\n\n"
-                f"Questions detected: {total_found}\n"
-                f"Answer Key entries: {key_count}\n\n"
-                "PDF format check karein."
+                "❌ PDF se text nahi mil paaya. "
+                "Ye scanned/image PDF ho sakti hai."
             )
-
             return
 
+        exercises = detect_exercises(text)
+
+        if not exercises:
+            await status.edit_text(
+                "❌ Questions aur answer key match nahi ho paaye.\n\n"
+                "PDF mein supported question format ya answer key "
+                "detect nahi hui."
+            )
+            return
+
+        context.user_data["exercises"] = exercises
+        context.user_data["waiting_selection"] = True
+
+        lines = ["📚 PDF Exercises Found\n"]
+
+        total_questions = 0
+
+        for index, exercise in enumerate(exercises, start=1):
+            count = len(exercise["questions"])
+            total_questions += count
+            lines.append(f"{index}. {exercise['name']} — {count} Questions")
+
+        lines.append(f"\nTotal Exercises: {len(exercises)}")
+        lines.append(f"Total Matched Questions: {total_questions}")
+        lines.append("\nExercise select karo:\n")
+
+        for index in range(1, len(exercises) + 1):
+            lines.append(str(index))
+
+        lines.append(f"{len(exercises) + 1}. All Exercises")
+
+        # Selection 4 is reserved for all exercises in the
+        # requested 3-exercise PDF format.
+        # For PDFs with another number of exercises, All is last.
+        lines.append("\nReply mein sirf number likho.")
+
+        await status.edit_text("\n".join(lines))
+
+    except Exception as e:
+        logger.exception("PDF processing error")
         await status.edit_text(
-            f"✅ {len(quizzes)} questions match hue.\n"
-            "📤 Quiz polls bheje ja rahe hain..."
+            f"❌ PDF process nahi ho paayi.\nError: {str(e)[:300]}"
         )
 
-        sent = 0
-        failed = 0
 
-        for question in quizzes:
+# ================= QUIZ SENDER =================
 
-            if context.user_data.get("cancelled"):
-                break
+async def send_exercise_polls(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    selected_exercises,
+):
+    total = sum(len(ex["questions"]) for ex in selected_exercises)
 
+    progress = await update.message.reply_text(
+        f"🚀 Quiz banana start ho gaya!\n"
+        f"Total Questions: {total}"
+    )
+
+    sent = 0
+    failed = 0
+
+    for exercise in selected_exercises:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"📚 {exercise['name']}\n"
+                 f"Questions: {len(exercise['questions'])}",
+        )
+
+        for question in exercise["questions"]:
             try:
-
                 await context.bot.send_poll(
                     chat_id=update.effective_chat.id,
                     question=question["question"],
@@ -441,101 +447,100 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
                 sent += 1
+                await asyncio.sleep(POLL_DELAY)
 
-            except Exception:
-
+            except TelegramError as e:
                 failed += 1
-
-                log.exception(
-                    "Poll failed for Q%s",
-                    question["number"]
+                logger.warning(
+                    "Poll failed for question %s: %s",
+                    question["number"],
+                    e,
                 )
 
-            if sent and sent % 5 == 0:
+    await progress.edit_text(
+        "✅ Quiz Completed!\n\n"
+        f"📤 Polls Sent: {sent}\n"
+        f"❌ Failed: {failed}\n"
+        f"📚 Exercises: {len(selected_exercises)}"
+    )
 
-                try:
+    context.user_data.pop("exercises", None)
+    context.user_data.pop("waiting_selection", None)
 
-                    await status.edit_text(
-                        f"📤 Polls sent: {sent}/{len(quizzes)}\n"
-                        f"❌ Failed: {failed}"
-                    )
 
-                except Exception:
-                    pass
+# ================= SELECTION HANDLER =================
 
-            await asyncio.sleep(POLL_DELAY)
+async def selection_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_allowed(update.effective_user.id):
+        return
 
-        if context.user_data.get("cancelled"):
+    if not context.user_data.get("waiting_selection"):
+        return
 
-            await status.edit_text(
-                f"⚠️ Process cancelled.\n\n"
-                f"Polls sent: {sent}\n"
-                f"Failed: {failed}"
-            )
+    exercises = context.user_data.get("exercises")
 
-        else:
-
-            await status.edit_text(
-                "🎉 Quiz conversion completed!\n\n"
-                f"Questions detected: {total_found}\n"
-                f"Answer Key entries: {key_count}\n"
-                f"Matched questions: {len(quizzes)}\n"
-                f"Polls sent: {sent}\n"
-                f"Failed: {failed}"
-            )
-
-    except Exception as error:
-
-        log.exception("PDF processing error")
-
-        await status.edit_text(
-            f"❌ Error: {str(error)[:250]}"
+    if not exercises:
+        await update.message.reply_text(
+            "❌ Pehle PDF upload karo."
         )
+        return
 
-    finally:
+    value = update.message.text.strip()
 
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+    if not re.fullmatch(r"\d+", value):
+        return
 
+    selection = int(value)
+    all_option = len(exercises) + 1
+
+    if selection < 1 or selection > all_option:
+        await update.message.reply_text(
+            f"❌ Invalid selection. 1 se {all_option} tak number bhejo."
+        )
+        return
+
+    context.user_data["waiting_selection"] = False
+
+    if selection == all_option:
+        selected = exercises
+    else:
+        selected = [exercises[selection - 1]]
+
+    await send_exercise_polls(update, context, selected)
+
+
+# ================= MAIN =================
 
 def main():
-
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN environment variable missing"
-        )
+        raise RuntimeError("BOT_TOKEN environment variable missing.")
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(True)
-        .build()
-    )
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CommandHandler("help", help_command)
-    )
-
-    app.add_handler(
-        CommandHandler("cancel", cancel)
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("cancel", cancel))
 
     app.add_handler(
         MessageHandler(
             filters.Document.PDF,
-            handle_pdf
+            pdf_handler,
         )
     )
 
-    log.info("PDF Quiz Poll Maker started")
-
-    app.run_polling(
-        drop_pending_updates=True
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            selection_handler,
+        )
     )
+
+    logger.info("PDF Quiz Bot Started!")
+
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
