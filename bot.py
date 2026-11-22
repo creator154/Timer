@@ -563,3 +563,241 @@ async def handle_text(update, context):
 
     finally:
         context.user_data["processing"] = False
+# ---------------------------------------------------------
+# PDF HANDLER
+# ---------------------------------------------------------
+
+async def handle_pdf(update, context):
+    message = update.message
+
+    if not message or not message.document:
+        return
+
+    if not is_owner(update):
+        await message.reply_text(
+            "This bot is restricted to its owner."
+        )
+        return
+
+    if context.user_data.get("processing"):
+        await message.reply_text(
+            "⏳ Aapka ek quiz pehle se process ho raha hai."
+        )
+        return
+
+    document = message.document
+
+    if not document.file_name.lower().endswith(".pdf"):
+        await message.reply_text("❌ Please send a PDF file.")
+        return
+
+    max_size = MAX_PDF_MB * 1024 * 1024
+
+    if document.file_size and document.file_size > max_size:
+        await message.reply_text(
+            f"❌ PDF size {MAX_PDF_MB} MB se kam honi chahiye."
+        )
+        return
+
+    context.user_data["processing"] = True
+    context.user_data["cancelled"] = False
+
+    status = await message.reply_text(
+        "📥 PDF download ho rahi hai..."
+    )
+
+    temp_path = None
+
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".pdf",
+            delete=False
+        ) as temp:
+            temp_path = temp.name
+
+        await telegram_file.download_to_drive(temp_path)
+
+        if os.path.getsize(temp_path) > max_size:
+            await status.edit_text("❌ PDF size limit exceed.")
+            return
+
+        await status.edit_text(
+            "📖 PDF read ho rahi hai..."
+        )
+
+        pages = extract_pdf_pages(temp_path)
+        full_text = "\n".join(pages)
+
+        questions = parse_questions(full_text)
+        answers = parse_answer_key(full_text)
+
+        quizzes = []
+
+        for question in questions:
+            answer = answers.get(question["number"])
+
+            if not answer or answer not in "ABCD":
+                continue
+
+            quizzes.append({
+                "number": question["number"],
+                "question": question["question"],
+                "options": question["options"],
+                "correct": "ABCD".index(answer),
+            })
+
+        if not quizzes:
+            await status.edit_text(
+                "❌ PDF se valid questions aur answers match nahi hue.\n\n"
+                f"Questions extracted: {len(questions)}\n"
+                f"Answers extracted: {len(answers)}\n\n"
+                "Heroku logs check karein."
+            )
+            return
+
+        await status.edit_text(
+            f"✅ PDF parsed successfully!\n\n"
+            f"Questions: {len(questions)}\n"
+            f"Answers: {len(answers)}\n"
+            f"Matched: {len(quizzes)}\n\n"
+            "📤 Polls bheje ja rahe hain..."
+        )
+
+        await send_quiz_polls(
+            update,
+            context,
+            quizzes,
+            status,
+            "PDF"
+        )
+
+    except Exception as error:
+        log.exception("PDF processing error")
+        try:
+            await status.edit_text(
+                f"❌ PDF processing error:\n{str(error)[:2500]}"
+            )
+        except Exception:
+            pass
+
+    finally:
+        context.user_data["processing"] = False
+
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------
+# COMMANDS
+# ---------------------------------------------------------
+
+async def start(update, context):
+    if not is_owner(update):
+        await update.message.reply_text(
+            "This bot is restricted to its owner."
+        )
+        return
+
+    await update.message.reply_text(
+        "🚀 PDF TO QUIZ POLL MAKER\n\n"
+        "Bot PDF aur direct text dono se Quiz Poll bana sakta hai.\n\n"
+        "📄 PDF: Apni MCQ PDF bhejein.\n"
+        "📝 TEXT: MCQ text bhejein, correct option par ✅ lagayein.\n\n"
+        "/help - Help\n"
+        "/cancel - Stop current process\n\n"
+        "Powered by @SumitTripathi"
+    )
+
+
+async def help_command(update, context):
+    await update.message.reply_text(
+        "📚 HOW TO USE\n\n"
+        "1. PDF bhejein: Bot answer key se correct answers match karega.\n\n"
+        "2. Direct Text bhejein:\n\n"
+        "1. Question?\n"
+        "A) Option 1\n"
+        "B) Option 2\n"
+        "C) Option 3 ✅\n"
+        "D) Option 4\n\n"
+        "Har question mein exactly ek ✅ hona chahiye.\n\n"
+        "Commands:\n"
+        "/start - Start bot\n"
+        "/help - Help\n"
+        "/cancel - Cancel process"
+    )
+
+
+async def cancel(update, context):
+    if not is_owner(update):
+        return
+
+    if context.user_data.get("processing"):
+        context.user_data["cancelled"] = True
+        await update.message.reply_text(
+            "⚠️ Cancellation request received."
+        )
+    else:
+        await update.message.reply_text(
+            "Koi process currently running nahi hai."
+        )
+
+
+# ---------------------------------------------------------
+# ERROR HANDLER
+# ---------------------------------------------------------
+
+async def error_handler(update, context):
+    log.error(
+        "Telegram update error",
+        exc_info=context.error
+    )
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable missing")
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("cancel", cancel))
+
+    application.add_handler(
+        MessageHandler(
+            filters.Document.PDF,
+            handle_pdf
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_text
+        )
+    )
+
+    application.add_error_handler(error_handler)
+
+    log.info("Bot starting...")
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+
+if __name__ == "__main__":
+    main()
